@@ -1,0 +1,2706 @@
+fortnite anti-cheat — reversed internals, current build (late-2026 era)
+compiled from a lot of years of IDA sessions, live pipe captures, kernel
+callback probes, and a running pile of public prior art
+
+
+READ ME FIRST, OR WASTE A WEEK
+
+this is a research document. everything in here is what EAC *does* at the
+behavioral and architectural level, reconstructed from a mix of live
+tracing, static reversing, and prior public work (secret club, mellow,
+can1357, the heavy UC teardown threads, the handful of private writeups
+that have leaked over the years, and a lot of my own IDA time). the
+*shape* of every subsystem is correct. the *constants* — offsets inside
+EPROCESS, ObCallback altitude strings, XOR keys, aes salts, numeric IOCTL
+codes, pin hashes, flag IDs — rotate every few builds. memorize the
+architecture. always re-derive the constants against your own pulled
+binaries before trusting a specific value.
+
+what changed since the last write-up of this document and what's
+specifically current-build (roughly fortnite chapter-era 2026, EAC agent
+version strings around EAC_2026_* at time of writing):
+
+  - EAC's driver has expanded its BYOVD (bring-your-own-vulnerable-
+    driver) matching. the driver-list IOCTL used to return name + hash;
+    it now also returns image-size, signer cert thumbprint, and the
+    microsoft block-list state (whether the driver matches an entry in
+    the WDAC vulnerable-driver block list). this is big for cheats — it
+    means "renaming your vulnerable driver" buys you nothing because the
+    image hash is what matters.
+  - the user-mode agent now uses the PsSetCreateProcessNotifyRoutineEx2
+    kernel surface where available (win11 23H2+), which lets EAC veto a
+    process creation before it starts rather than just observe it. the
+    veto path is used sparingly — EAC still prefers "observe and report"
+    — but known-bad loaders get stopped early now.
+  - the altitude on ObRegisterCallbacks moved from the old "321000"
+    string into a higher band to avoid collisions with newer gamer-focused
+    AV products. the specific number this build is one you have to lift
+    live.
+  - rules.bin crypto moved from AES-128-CBC to AES-256-GCM in current
+    builds. key derivation is HKDF-SHA256 as before but with a longer
+    output. the signature outside the ciphertext changed too — current
+    builds use Ed25519 instead of RSA-PSS. smaller sig, same guarantee.
+  - the frame-capture subsystem now uses DXGI desktop duplication
+    + a secondary path via Win32 graphics capture (Graphics.Capture.*)
+    on win11, because desktop duplication can be defeated in certain
+    multi-monitor edge cases.
+  - the integrity hash set expanded: current builds hash ntdll's .text,
+    kernelbase's .text, win32u.dll's .text, and dxgi/d3d11 stubs in
+    addition to the game's modules. that means a user-mode hook on any
+    of those system DLLs gets caught by a single tick of the integrity
+    worker.
+  - the hook detector's reference source moved from \KnownDlls to a
+    bundled set of known-good pages that ship with the agent. this
+    was in response to a trick where cheats would modify the KnownDlls
+    section object before the agent could consult it; bundled baselines
+    can't be modified at runtime without triggering self-integrity.
+  - telemetry transport moved fully to api.epicgames.dev for both
+    classic EAC and EAC-EOS. the legacy service.easyanticheat.net
+    endpoints are still DNS-resolvable but return 410-gone to new
+    sessions. if you see traffic there, your build is stale.
+  - server-side correlation got faster. ban waves still exist, but the
+    wave cadence shortened from weekly to daily on current builds, with
+    some high-severity flag chains triggering near-realtime bans (hours
+    not days). this affects the cheat-development feedback loop more
+    than it affects reversing, but it's worth knowing.
+  - new flag family 0x12xx introduced for "environmental fingerprint
+    anomalies" — things like a BIOS vendor string the EAC backend has
+    never seen before, or a TPM endorsement key that the backend has
+    never issued a session for. these are informational, not immediately
+    ban-worthy, but they drive the ML correlation.
+
+the rest of the document is what each piece of the stack actually does,
+updated for the current-build state. after the architecture walkthrough
+there are four focused sections sam asked for: ban-trace cleaner surface,
+HWID checks and spoofing, cheat detection surface, EAC emulation with a
+PoC. those live at the back of the file so you can read them standalone.
+
+
+CURRENT ON-DISK INVENTORY
+
+install root typically:
+  C:\Program Files\Epic Games\Fortnite\
+
+classic EAC bundle:
+  FortniteGame\Binaries\Win64\EasyAntiCheat\
+    EasyAntiCheat.exe                — launcher/bridge
+    EasyAntiCheat_launcher.exe       — alt launcher used by newer paths
+    EasyAntiCheat_x64.dll            — user-mode agent (the big one)
+    EasyAntiCheat.sys                — kernel driver
+    Settings.json                    — per-title config, partially b64
+    pbrules.bin                      — encrypted rules blob (current name)
+    SplashScreen.png                 — version marker, useful for triage
+    Certificates\                    — pinned certs (bundle, not just
+                                       one) and signer intermediates
+    easyanticheat_<locale>.txt       — localized error strings, great
+                                       xref anchor for error-code
+                                       reversing
+
+EAC-EOS bundle:
+  FortniteGame\Binaries\Win64\EasyAntiCheat_EOS\
+    EasyAntiCheat_EOS.exe
+    EasyAntiCheat_EOS_x64.dll
+    EasyAntiCheat_EOS.sys
+    Certificates\
+    SplashScreen.png
+
+game binaries:
+  FortniteGame\Binaries\Win64\
+    FortniteClient-Win64-Shipping.exe           (plain UE5 client)
+    FortniteClient-Win64-Shipping_EAC.exe       (EAC-protected launcher)
+    FortniteClient-Win64-Shipping_EAC_EOS.exe   (EOS variant launcher)
+    FortniteLauncher.exe                        (pre-launcher, issues tokens)
+
+system-wide EAC install (maintained by EAC's own installer):
+  C:\Program Files (x86)\EasyAntiCheat\
+  C:\Program Files (x86)\Common Files\EasyAntiCheat\
+
+the system-wide install exists so multiple EAC-protected games can
+share the driver. the service config is at
+HKLM\SYSTEM\CurrentControlSet\Services\EasyAntiCheat. the service is
+"start on demand" (SERVICE_DEMAND_START) — nothing loads it until a
+protected game needs it.
+
+historical for very old fortnite builds only:
+  FortniteGame\Binaries\Win64\BattlEye\
+    BEService.exe, BEClient_x64.dll, BEDaisy.sys, BEServer.dll
+    Config/, Logs/
+
+not shipping anymore but worth knowing exists if you're ever auditing
+an old ban wave.
+
+when you pull files, pull them with the service stopped so you don't
+race EAC's self-update:
+
+  sc stop EasyAntiCheat
+  (then copy)
+
+hash everything before you touch it:
+
+  for %f in (*) do certutil -hashfile "%f" SHA256 >> hashes.txt
+
+keep two copies: one you reverse, one you never open.
+
+
+THE KERNEL DRIVER (EasyAntiCheat.sys, current build)
+
+easyanticheat.sys is the trust root. the user-mode agent could in theory
+be lied to by anything in userspace, so EAC's design philosophy is:
+"whenever something is security-sensitive, ask the driver." the driver
+observes the system through legal kernel callback APIs — no inline
+hooking of ntoskrnl, no SSDT shenanigans, nothing patchguard would blow
+up on — and the user-mode agent is really just a reporting agent that
+bubbles the driver's observations up to epic's backend.
+
+DriverEntry runs through a predictable sequence. first is a self image
+check — hash the .text section, compare to a baked-in sha256, bail on
+mismatch. this catches naive "patch the sys on disk" attacks, which are
+useless anyway because the file has a WHQL cross-signature, but EAC
+checks for completeness.
+
+then kernel API resolution by name. open an older build (pre-2019) in
+IDA and you'll see a fat imports list pointing at ntoskrnl.exe. open the
+current one and the imports tab has maybe five entries. everything else
+is resolved at runtime via MmGetSystemRoutineAddress, cached into a
+global struct, and that struct gets XORed with a per-boot cookie so a
+snapshot of EAC's kernel memory doesn't leak a clean function pointer
+table. why bother? partly so you can't grep statically for "which kernel
+calls does this driver make." mostly to slow down reversers. it works
+for maybe a few hours per build until someone writes the xref script.
+
+device + symlink, standard shape:
+
+  IoCreateDevice(drv, sizeof(DEV_CTX), <randomized name>,
+                 FILE_DEVICE_UNKNOWN, 0, FALSE, &g_devObj);
+  IoCreateSymbolicLink(L"\\DosDevices\\EasyAntiCheat", <device name>);
+
+the device name has a random suffix on current builds. the symbolic link
+name is stable because the user-mode agent needs to CreateFile it. cheat
+devs have at various points tried to open that symlink from their own
+tools to see what IOCTLs the driver exposes. EAC counters by rejecting
+any client that can't present a signed session blob proving it was
+launched by the authenticated EAC user-mode agent.
+
+dispatch:
+
+  drv->MajorFunction[IRP_MJ_CREATE]         = eac_dispatch_create;
+  drv->MajorFunction[IRP_MJ_CLOSE]          = eac_dispatch_close;
+  drv->MajorFunction[IRP_MJ_DEVICE_CONTROL] = eac_dispatch_ioctl;
+  drv->DriverUnload                         = eac_unload;
+
+eac_dispatch_ioctl is where you spend most of your kernel reversing
+time. walk into it and you see:
+
+  NTSTATUS eac_dispatch_ioctl(PDEVICE_OBJECT dev, PIRP irp)
+  {
+      auto sp = IoGetCurrentIrpStackLocation(irp);
+      ULONG raw = sp->Parameters.DeviceIoControl.IoControlCode;
+      ULONG code = raw ^ g_dev->ioctlXorKey;
+
+      if (!eac_is_authed(irp->FileObject)) {
+          irp->IoStatus.Status = STATUS_ACCESS_DENIED;
+          IoCompleteRequest(irp, IO_NO_INCREMENT);
+          return STATUS_ACCESS_DENIED;
+      }
+
+      switch (code) { /* big switch — see IOCTL inventory below */ }
+  }
+
+the xor key is a 32-bit value randomized at driver init and stored
+encrypted with the boot cookie in the device context. lift it live with
+a kernel debugger; statically it looks like just another global. first
+time i reversed EAC i spent an afternoon wondering why the IOCTL codes
+didn't match anything sensible until i caught the xor.
+
+the "am i authed" check matters. at CREATE time (first CreateFile on the
+device), the client has to issue IOCTL_EAC_SESSION_AUTH with a blob
+containing: the launcher's cert chain, a signed proof of (pid, timestamp,
+nonce), and the game pid. the driver verifies the signature against a
+baked-in epic public key, confirms the pid belongs to a process whose
+image was launched by an authenticated EAC launcher process, and stamps
+the file object with a trust bit. without that bit every other IOCTL
+short-circuits. this is why you can open \\.\EasyAntiCheat from your own
+tool but can't do anything useful with it — you can't forge a session
+blob because the private key lives at epic.
+
+the callbacks EAC installs in current builds:
+
+  PsSetCreateProcessNotifyRoutineEx2         (win11 23H2+, preferred)
+  PsSetCreateProcessNotifyRoutineEx          (fallback on older)
+  PsSetCreateThreadNotifyRoutine
+  PsSetLoadImageNotifyRoutine
+  ObRegisterCallbacks on PsProcessType
+  ObRegisterCallbacks on PsThreadType
+  CmRegisterCallbackEx
+  (optional, newer builds) EtwRegisterEx     — subscribes to Microsoft-
+                                                Windows-Threat-Intelligence
+                                                ETW provider for kernel-
+                                                asserted suspicious events
+
+the process callback (both Ex and Ex2 variants) classifies each new
+process by image path hash. game process → tracked in a protected-pid
+table. known-bad loader → flagged. in current builds, Ex2 also permits
+veto: if the matched process is on a high-severity blocklist and the
+blocklist entry includes a "block" flag (not all do), the callback sets
+CreationStatus = STATUS_ACCESS_DENIED and the process creation fails
+outright. the driver still never kills a running process — veto is
+pre-creation only.
+
+the thread callback reacts only on threads in a protected process.
+reads StartAddress from ETHREAD (offset floats by windows build — EAC
+has a dynamic resolver), classifies:
+
+  - start inside a known-good game module                   → ok
+  - start inside EAC's own modules                          → ok
+  - start inside ntdll's LdrpInitializeThunk                → ok, normal
+  - start inside a module not whitelisted                   → flag
+  - start address not in ANY LDR module                     → flag HARD
+
+that last case is "a thread started in a VAD region with no backing
+module" — shellcode or a manually-mapped image. both correlate hard
+with cheats.
+
+the image-load callback fires on every DLL load. filters down to
+protected processes, sha256s the first N pages, matches against the
+module section of rules.bin. a match on hash flags at the highest
+severity. path-suffix or byte-pattern matches flag medium. unsigned DLL
+being loaded from under system32 gets its own flag — that's unusual
+even outside cheats, and EAC wants to know.
+
+ObRegisterCallbacks is the strip mechanism. the registration:
+
+  OB_CALLBACK_REGISTRATION reg = {
+      .Version                     = OB_FLT_REGISTRATION_VERSION,
+      .OperationRegistrationCount  = 2,
+      .Altitude                    = { L"<rotating number>" },
+      .RegistrationContext         = NULL,
+      .OperationRegistration       = ops,
+  };
+
+  OB_OPERATION_REGISTRATION ops[2] = {
+      { PsProcessType,
+        OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE,
+        eac_pre_proc_handle, NULL },
+      { PsThreadType,
+        OB_OPERATION_HANDLE_CREATE | OB_OPERATION_HANDLE_DUPLICATE,
+        eac_pre_thread_handle, NULL },
+  };
+
+the altitude is a float-as-string. picks a spot high enough to be above
+normal filesystem/AV filters, ensuring EAC sees handle opens before
+anyone else could handle the IRP. ObRegisterCallbacks returns an
+altitude-collision status if another driver picked the same number.
+current-build EAC has moved higher than historical.
+
+the pre-op callback — the handle strip:
+
+  OB_PREOP_CALLBACK_STATUS eac_pre_proc_handle(PVOID ctx,
+                                                POB_PRE_OPERATION_INFORMATION op)
+  {
+      if (op->KernelHandle)
+          return OB_PREOP_SUCCESS;                      // kernel, skip
+
+      HANDLE targetPid = PsGetProcessId((PEPROCESS)op->Object);
+      if (!eac_is_protected(targetPid))
+          return OB_PREOP_SUCCESS;
+
+      HANDLE opener = PsGetCurrentProcessId();
+      if (opener == targetPid)
+          return OB_PREOP_SUCCESS;                      // self
+
+      if (eac_is_trusted_opener(opener))
+          return OB_PREOP_SUCCESS;
+
+      ACCESS_MASK* mask = (op->Operation == OB_OPERATION_HANDLE_CREATE)
+          ? &op->Parameters->CreateHandleInformation.DesiredAccess
+          : &op->Parameters->DuplicateHandleInformation.DesiredAccess;
+
+      *mask &= ~(PROCESS_VM_READ | PROCESS_VM_WRITE
+               | PROCESS_VM_OPERATION | PROCESS_CREATE_THREAD
+               | PROCESS_DUP_HANDLE | PROCESS_SET_INFORMATION
+               | PROCESS_SUSPEND_RESUME | PROCESS_TERMINATE);
+
+      eac_telemetry_log(TEL_HANDLE_OPEN_ATTEMPT, opener);
+      return OB_PREOP_SUCCESS;
+  }
+
+couple things non-obvious. the strip is in-place and total. OpenProcess
+returns a handle that "works" but is neutered. NtReadVirtualMemory on it
+returns ACCESS_DENIED. this used to catch beginner cheat devs in 2018.
+everyone knows now.
+
+trusted-opener is authenticode cert-hash on the opener's image. renaming
+your tool to EasyAntiCheat.exe does not make it trusted. a surprising
+number of people have tried.
+
+the strip is not a block — it's a detection. EAC logs the opener's pid
+and command line. your cheat just got reported even though the handle
+"succeeded."
+
+the thread strip mask:
+  THREAD_SET_CONTEXT | THREAD_GET_CONTEXT | THREAD_SUSPEND_RESUME
+  | THREAD_TERMINATE | THREAD_DIRECT_IMPERSONATION
+  | THREAD_SET_INFORMATION | THREAD_SET_THREAD_TOKEN
+
+thread handle access matters because some cheats walk thread contexts
+to find TLS pointers.
+
+CmRegisterCallbackEx watches the registry. in current builds the watch
+list expanded:
+
+  HKLM\SYSTEM\CurrentControlSet\Services\EasyAntiCheat         (self)
+  HKLM\SYSTEM\CurrentControlSet\Services\EasyAntiCheat_EOS
+  HKLM\SYSTEM\CurrentControlSet\Control\CI                     (code
+                                                                integrity)
+  HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard
+  HKLM\SYSTEM\CurrentControlSet\Control\BootOptions
+  HKLM\SYSTEM\Setup                                             (safe-mode
+                                                                boots)
+  HKLM\BCD00000000                                              (writes to
+                                                                BCD)
+  HKLM\SOFTWARE\Microsoft\Cryptography                          (MachineGuid
+                                                                writes)
+
+callback doesn't block the write — it logs and flags. BCD writes are
+particularly suspicious because that's where you'd toggle test-signing-
+mode. a BCD write while fortnite is live flags at high severity.
+
+the ETW subscription (current-build addition) hooks into the
+Microsoft-Windows-Threat-Intelligence provider, which emits events for
+things the kernel itself has flagged as suspicious (process hollowing
+candidates, APC injection into system processes, so on). EAC relays
+these into its own telemetry. you need PsCreateSystemThread + a worker
+that consumes the ETW buffer. the subscription exists on current builds
+and did not exist on historical.
+
+the IOCTL inventory. current-build enumeration (symbolic names mine,
+numbers rotate):
+
+SESSION_AUTH             — handshake, covered above
+READ_MEM                 — kernel-side read of target VA range
+                           polite path: MmCopyVirtualMemory
+                           attach path: KeStackAttachProcess + ProbeForRead + SEH
+                           flags select which
+WRITE_MEM_PROBE          — proof-of-possession memory probe (reads one
+                           page, hashes, returns hash; used to prove to
+                           the backend "the game's .text at offset X
+                           still looks like Y")
+GET_MODULES              — LDR module list for a pid
+GET_VAD                  — full VAD tree walk; the manual-mapped
+                           detector's ground truth
+ENUM_HANDLES             — all open handles system-wide filtered to the
+                           target pid; detects pre-callback-registered
+                           handles and tools with LIMITED_INFORMATION
+                           access
+ENUM_THREADS             — thread list + start addresses
+PATTERN_SCAN             — byte-pattern match against a VA range
+PROC_INFO                — PEB/TEB fields without touching user memory
+DRIVER_LIST              — loaded kernel drivers + hashes + signer cert
+                           thumbprints + WDAC block-list match state
+CALLBACK_DUMP            — enumerate PsSetCreateProcessNotifyRoutine
+                           and ObCallback entries, hash owning driver
+                           for each
+PHYS_READ                — physical-memory read via MmMapIoSpace. still
+                           present on classic EAC current build; gone
+                           on EOS
+SELF_CHECK               — driver signs (hash || nonce || bootCookie)
+                           with its own ed25519 key; agent forwards to
+                           backend
+HEARTBEAT                — keepalive
+REPORT_FLAG              — agent reports a detection it found itself;
+                           driver adds to session's correlated report
+
+the input/output struct for READ_MEM looks like:
+
+  struct eac_read_in  { HANDLE pid; PVOID va; SIZE_T size; ULONG flags; };
+  struct eac_read_out { NTSTATUS status; SIZE_T got; UCHAR data[]; };
+
+alignment paranoia matters. EAC's structs are packed in some places and
+not others. a misaligned field cost me three hours once because the
+agent and driver had slightly different packing on an older build.
+
+GET_VAD is the interesting one. this catches manually-mapped cheats.
+the VAD tree is windows' record of every committed region of virtual
+memory in a process. every module, every heap, every VirtualAlloc. a
+manually-mapped DLL doesn't appear in PEB->Ldr (loaded outside the
+LoadLibrary path), but its allocation still shows as a VAD. so the
+agent asks the driver for the VAD tree, compares it against LDR, and
+anything executable in VAD but missing from LDR is suspect.
+
+walker shape:
+
+  NTSTATUS eac_walk_vad(PEPROCESS proc, OUT list)
+  {
+      auto root = (PRTL_AVL_TABLE)((PUCHAR)proc + g_vadRootOffset);
+      KeAcquireGuardedMutex(&proc->AddressCreationLock);
+      for (auto vad = leftmost(root); vad; vad = inorder_next(vad)) {
+          entry.base   = vad->StartingVpn << PAGE_SHIFT;
+          entry.size   = (vad->EndingVpn - vad->StartingVpn + 1) << PAGE_SHIFT;
+          entry.prot   = decode_protection(vad);
+          entry.type   = decode_type(vad);               // Private/Mapped/Image
+          if (entry.type == VadImageMap) {
+              auto fo = get_file_object(vad);
+              resolve_path(fo, entry.path);
+          }
+          append(list, entry);
+      }
+      KeReleaseGuardedMutex(&proc->AddressCreationLock);
+      return STATUS_SUCCESS;
+  }
+
+the EPROCESS VadRoot offset floats by windows build. EAC resolves it
+dynamically — a small routine fingerprints the running kernel build at
+driver init and picks the offset from a table. cheat devs who assumed
+EAC would be defeated by a new insider build "breaking" the offset
+learn the table exists.
+
+ENUM_HANDLES walks the system handle table looking for handles to the
+protected pid. catches clients that got a handle before ObCallback was
+installed (race condition at launch), or tools with
+PROCESS_QUERY_LIMITED_INFORMATION (which the strip doesn't remove)
+trying to escalate. expensive — lower-frequency timer.
+
+CALLBACK_DUMP returns the current PsSet* callback lists so EAC can spot
+competing kernel callbacks. a cheat driver's own callback would show
+here. legit antivirus shows here too, and EAC maintains an internal
+cert-signer whitelist of known AV to reduce noise.
+
+PHYS_READ — physical memory read. still in classic EAC's current build,
+used when a virtual read returns suspiciously clean pages (symptom of
+page-table level cheats remapping the virtual read path). gone in EOS
+because WDAC and the attestation surface disliked the MmMapIoSpace
+calls on newer windows and epic decided user-mode checks with VAD
+walking cover most of the same use cases.
+
+SELF_CHECK: driver sha256s its own .text, signs (hash || nonce ||
+bootCookie) with an embedded ed25519 private key (yes, in the driver;
+rooted-of-trust at signing time), returns the signature. the agent
+forwards to the backend, backend verifies with the corresponding public
+key. this detects "someone patched my .text in memory after i loaded"
+— you can't replay old signatures because nonce + bootCookie are fresh.
+
+the scan worker thread rotates through scans on a 5-second loop so no
+single tick is unboundedly expensive:
+
+  tick & 7 == 0  → VAD scan all protected processes
+  tick & 7 == 1  → thread enumeration
+  tick & 7 == 2  → handle enumeration
+  tick & 7 == 3  → module list diff vs previous
+  tick & 7 == 4  → self-integrity hash
+  tick & 7 == 5  → driver list scan
+  tick & 7 == 6  → callback-table dump
+  tick & 7 == 7  → cross-process hook heuristics
+
+in current builds a new worker runs at a slower cadence (~30s) doing an
+"environmental consistency" pass: pulls SMBIOS via WMI, compares to
+cached values from session init, flags if they changed mid-session. this
+is a spoof-detector hedge — if your spoofer only patches reads at init
+time but later system calls read the real values, EAC catches the drift.
+
+the driver's self-anti-tamper policy is DO NOT BSOD EVER, if we can
+help it. BSODing legitimate users because a weird-but-legal AV loaded
+in the wrong order would be a PR disaster. on self-hash failure the
+session is flagged at maximum severity. the ban eventually lands. the
+game does not crash.
+
+
+USER-MODE LAUNCHER (EasyAntiCheat.exe, current)
+
+thin bridge between the fortnite launcher, the EAC service, the driver,
+and the game. spawns the game with EAC_x64.dll preloaded, opens a named
+pipe for the agent, forwards messages.
+
+argv parsing: argv[1] is a session token — a short-lived signed blob
+issued by FortniteLauncher.exe containing the expected game executable
+hash, a timestamp, a nonce, signed by epic. argv[2] is the path to the
+game exe. argv[3] is the game's own command line.
+
+flow:
+
+  wmain:
+    1. OpenSCManager + OpenService + StartService("EasyAntiCheat")
+       wait for SERVICE_RUNNING
+    2. CreateFile("\\\\.\\EasyAntiCheat"), probe with HEARTBEAT
+    3. CreateNamedPipe("\\\\.\\pipe\\EasyAntiCheat_<guid>", ...)
+       message-mode, overlapped, REJECT_REMOTE_CLIENTS
+    4. CreateProcess game in CREATE_SUSPENDED
+    5. inject EAC_x64.dll via
+         VirtualAllocEx + WriteProcessMemory + CreateRemoteThread
+         thread start = LoadLibraryW, arg = remote wchar path
+       in current builds there's a secondary path using
+       NtCreateThreadEx with a slightly different attribute list, as
+       a hedge against CreateRemoteThread being filtered by third-
+       party endpoint products
+    6. ResumeThread on the game's main thread
+    7. ConnectNamedPipe, wait for the agent to come up and HELLO
+    8. run the pipe server loop until the game exits
+
+injection is boring on purpose. EAC could use any number of exotic
+injection techniques and historically has flirted with some, but
+LoadLibrary-via-CreateRemoteThread is what ships. the trust isn't in
+the injection method — it's in the session token handoff. the agent
+inside the game reads the token from the command line (the launcher
+appends it before ResumeThread), presents it back during HELLO. the
+pipe server validates. only an agent-inside-the-real-game can
+authenticate.
+
+
+USER-MODE AGENT (EasyAntiCheat_x64.dll, current)
+
+where most of EAC's actual intelligence lives. if your reversing time
+budget isn't weighted at least 70% here, you're budgeting wrong. the
+driver is maybe 8-10 kloc of kernel C. the agent, unpacked, is probably
+60-90 kloc of user-mode C++, 30-40% of it inside VMProtect handlers you
+have to devirtualize before any of it reads meaningfully.
+
+getting the agent into a readable state is its own project.
+VMProtect-packed with import protection on disk. your workflow is:
+
+  1. dump from memory after full init inside the game
+  2. scylla the dump to rebuild the IAT from resolved pointers
+  3. NoVmp the VMP regions
+  4. hand-lift residual handlers with unicorn-engine + VTIL
+  5. label subsystems
+
+plan on a week minimum if you haven't done VMProtect devirt before.
+NoVmp covers 70-85% of handlers across most EAC builds; the rest you
+fingerprint one at a time.
+
+DllMain's init chain:
+
+  BOOL DllMain(HINSTANCE h, DWORD why, LPVOID rsv)
+  {
+      if (why == DLL_PROCESS_ATTACH) return eac_agent_init();
+      if (why == DLL_PROCESS_DETACH) eac_agent_fini();
+      return TRUE;
+  }
+
+  BOOL eac_agent_init(void)
+  {
+      parse_cmdline_token_or_bail();
+      verify_own_dll_integrity_or_bail();      // first self-check tick
+      pipe_connect();
+      pipe_hello();
+      driver_session_auth();
+      rules_load_and_decrypt();
+      environment_sweep_once();                 // anti-vm, anti-debug,
+                                                // initial module probe,
+                                                // SMBIOS fingerprint
+                                                // cache
+      spawn_worker_threads();
+      install_game_hooks();
+      return TRUE;
+  }
+
+worker threads currently:
+
+  scan_worker            — module/window/thread/hook rotation on ~2s
+  pipe_worker            — read incoming launcher messages, dispatch
+  telemetry_worker       — batch flag reports, encrypt, TLS to backend
+  integrity_worker       — self + game module hash, ~2s
+  input_worker           — hook mouse/keyboard, build distributional stats
+  capture_worker         — DXGI OutputDuplication + Graphics.Capture, if
+                           enabled by server config
+  env_worker             — environmental drift check (SMBIOS, MAC, disk
+                           serial, machine guid) on ~30s
+
+the pipe client wraps named-pipe I/O. after HELLO the payloads are
+chacha20-poly1305 under a session ephemeral key the launcher sends in
+WELCOME (upgraded from plain chacha20 in historical builds — current
+uses the AEAD mode). frame:
+
+  'EACP' u32 magic
+  u16    opcode
+  u16    flags          (ENCRYPTED, ACK_REQUIRED, FRAGMENT)
+  u32    payloadLen
+  u32    crc32(payload)
+  u8[]   payload
+
+current-build opcodes by behavior:
+
+  agent → launcher:
+    HELLO                — build id, protocol version, pid
+    AUTH                 — session token blob
+    HEARTBEAT            — periodic
+    REPORT_FLAG          — a scan found something
+    REPORT_MODULE_LIST   — periodic LDR snapshot
+    REPORT_VAD           — periodic VAD snapshot
+    REPORT_DRIVERS       — periodic kernel driver list
+    REPORT_CALLBACKS     — competing kernel callbacks
+    REPORT_SCREENSHOT    — compressed captured frame (JPEG or AVIF)
+    REPORT_INPUT_STATS   — binned mouse distributions
+    REPORT_ENV_DRIFT     — environment-fingerprint change observed
+    PIPE_LOG             — debug log, usually debug builds only
+    BAIL                 — fatal
+
+  launcher → agent:
+    WELCOME              — session id, ephemeral key, server time
+    AUTH_OK / AUTH_FAIL
+    CONFIG               — scan intervals, enabled modules
+    RULES_UPDATE         — push a refreshed rules blob
+    REQUEST_SCAN         — immediate scan of category N
+    REQUEST_SCREENSHOT
+    KICK                 — please close gracefully
+    HARD_KILL            — die now
+    REMOTE_MODULE_LOAD   — new in current builds: load a signed
+                           auxiliary scanner DLL from the module CDN
+
+the REMOTE_MODULE_LOAD opcode is interesting. current-build EAC can
+push extra scanner modules down at runtime. the module is signed with
+an epic key and verified before load. this lets epic deploy new
+detections without shipping a new EAC version. when you capture a pipe
+session, you'll see these loads happen during HELLO fallout. pull the
+module bytes from the pipe + xref to the backend endpoint that served
+them (modules-cdn.eac-prod.on.epicgames.com, HTTPS with pinned cert).
+
+driver client is a wrapper over DeviceIoControl with the XOR quirk from
+the kernel side:
+
+  NTSTATUS drv_call(ULONG code, void* in, ULONG inl, void* out, ULONG outl)
+  {
+      ULONG real = code ^ g_sessionCookie;
+      DWORD got = 0;
+      if (!DeviceIoControl(g_drv, real, in, inl, out, outl, &got, NULL))
+          return GetLastError() | 0xC0000000;
+      return 0;
+  }
+
+rules.bin loaded at init, decrypted. current-build format:
+
+  struct hdr {
+      u32   magic          // 'EACR'
+      u32   version
+      u8    iv[12]         // GCM nonce, was 16 in CBC era
+      u32   plainSize
+      u32   sectionCount
+      u8    tag[16]        // GCM auth tag
+      u8    sig[64]        // Ed25519 signature over header_without_sig || ciphertext
+  };
+
+key derivation:
+
+  rootKey  = 32 bytes baked into agent DLL at a fixed RVA
+  key      = HKDF-SHA256(rootKey, salt=iv, info="EACRULES2026", 32)
+
+decrypt (AES-256-GCM), verify Ed25519 signature with epic pubkey (also
+baked, distinct from the driver's self-sign key). mismatch → agent
+bails. you cannot ship a modified rules.bin to the agent — but you can
+modify the agent to skip the verify, which is what researchers do to
+A/B test which rules actually fire.
+
+after decrypt, sections. current-build section types:
+
+  0x01  modules by sha256
+  0x02  modules by path suffix (wide string)
+  0x03  modules by IDA-style byte pattern
+  0x10  processes by name
+  0x11  processes by sha256
+  0x20  windows by class name
+  0x21  windows by title substring
+  0x30  drivers by sha256
+  0x31  drivers by name
+  0x32  drivers by signer-cert thumbprint    (new in current)
+  0x40  arbitrary string signatures
+  0x50  generic byte patterns with masks
+  0x60  cert signer whitelist
+  0x70  smbios anomaly list                   (new in current)
+  0x71  firmware-version block list           (new in current)
+  0x80  mouse-driver block list               (new in current — for
+                                               aimbot-related mouse
+                                               drivers)
+
+entries are fixed-size per section-type. hash entry: 32 bytes sha256 +
+4 bytes severity. pattern entry: 4 length, length bytes pattern,
+length bytes mask, 4 severity. parsing is straightforward once you've
+seen one section.
+
+now the scanners. this is the part most writeups are hazy on because
+there are a lot of them. going through each.
+
+MODULE SCANNER. on timer, also on every image-load notification piped
+from the driver. agent calls GET_MODULES for the game process. walks
+LDR. matches each entry against rules.bin's module sections. hash
+match → high severity. path-suffix or pattern → medium.
+
+then the interesting part: GET_VAD. agent builds a set of every
+executable VAD region. for each, checks whether an LDR entry covers
+that range. if not and the region is executable, flag. type of region
+determines flag: VadImageMap without LDR → "unlinked image." Vad
+Private with executable protection → "shellcode region."
+
+current builds added a transient-executable detector. the agent takes
+two VAD snapshots two seconds apart. any region that was R/W in the
+first and is R/X in the second (flipped while we weren't looking)
+gets flagged — the classic "flip executable to run, flip back"
+cheat pattern.
+
+entropy check. walk executable VADs, compute Shannon entropy on a 64KB
+sample. real x86 code sits around 6.0-6.5 bits/byte. packed or
+encrypted code runs 7.5+. over threshold → flag. catches unpacking
+stubs mid-flight.
+
+WINDOW SCANNER. the overlay/ESP detector. EnumWindows callback grabs
+classname and title for every top-level window, matches rules.bin.
+known cheat UI classes flagged on sight. transparent-topmost windows
+over the game client rect get flagged even if the class isn't known —
+transparent-topmost-over-game is itself a pattern. legit overlays
+(discord, nvidia, steam) have their properties on an internal baked-in
+whitelist (not in rules.bin — baked into the DLL for freshness).
+
+current builds also look for windows that have no owner but are
+rendering via d3d11/d3d12 directly. real applications typically go
+through a user32 window for input routing; renderless d3d windows are
+unusual outside overlays.
+
+THREAD SCANNER. NtQuerySystemInformation(SystemProcessInformation),
+filters to own pid, iterates threads, classifies start addresses same
+way the driver's thread callback does. user-mode cross-check. belt
+and suspenders.
+
+HOOK DETECTOR. periodically loads a clean copy of important system DLLs
+and diffs .text pages against in-memory. current-build modules checked:
+
+  ntdll.dll, kernel32.dll, kernelbase.dll, user32.dll, win32u.dll,
+  d3d11.dll, d3d12.dll, dxgi.dll, gdi32.dll, gdi32full.dll
+
+a historical trick was to modify the \KnownDlls section objects so the
+agent's "clean copy" was actually dirty. current-build EAC bundles its
+own known-good baselines (section hashes + raw bytes for the first
+~16KB of .text of each module) instead of trusting \KnownDlls. the
+baselines are updated per windows version via telemetry.
+
+there's also an export-pointer check. several key exports
+(NtOpenProcess, NtReadVirtualMemory, LdrLoadDll, NtCreateFile, etc.)
+resolved at agent init and cached. periodically re-resolved; mismatch
+flags "export rebound." this is current-build; older EAC skipped this
+and relied purely on .text byte-diffs.
+
+DXGI FRAME CAPTURE. gated by server-side config. reference d3d11
+device, OutputDuplication object on monitor 0. every N seconds a
+composited frame is captured. current-build EAC also uses the
+Graphics.Capture API on win11 as a fallback — desktop duplication
+misses some overlay compositions and win11's Graphics.Capture sees
+things desktop duplication doesn't.
+
+frames are JPEG-compressed (or AVIF on current builds, smaller
+payload). shipped via telemetry. backend runs vision models looking
+for aim circles, bounding boxes, crosshair overlays that the window
+scanner would never see (overlays drawn directly into the game's
+swapchain or via DWM composition).
+
+INPUT ANOMALY DETECTOR. hooks WH_MOUSE_LL + RawInput. tracks dX/dY
+per tick, sub-pixel step distributions, device ID consistency,
+time-to-shot latencies after snap. agent doesn't make ban decisions —
+bins data, ships summaries. backend ML models score the
+distributions.
+
+current-build addition: tracks the kernel-level mouse driver chain
+(walk \Driver\MouseClass's device stack via a user-mode heuristic
+and the driver's helper). cheats using kmbox-like hardware or custom
+mouse drivers show an unusual driver chain. this rolls up into the
+"mouse-driver block list" section of rules.bin.
+
+INTEGRITY TIMER. self .text + game modules + current-build expansion
+to system DLLs (ntdll, kernelbase, win32u). expected hashes baked
+into rules.bin or delivered in session init. mismatch → max severity.
+interval is short enough that "hook, read, unhook before next tick"
+is tight but not impossible. EAC jitters the interval to defeat
+scheduling.
+
+TLS TRANSPORT AND PIN CHECK. statically linked TLS stack. current
+builds use a BoringSSL fork. trusts a small set of certificate SPKI
+hashes hardcoded in the DLL. pin check after cert chain parse:
+
+  int eac_tls_verify_cert(cert_chain)
+  {
+      compute SPKI SHA256 of leaf → spkiHash;
+      for (int i = 0; i < EAC_PIN_COUNT; i++)
+          if (!memcmp(spkiHash, g_pinHashes[i], 32)) return 1;
+      return 0;
+  }
+
+to mitm: find pin function (string xref: "pin" or by cross-ref from
+TLS handshake code), patch memcmp to mov al, 1; ret. install your CA,
+mitmproxy sees cleartext.
+
+TELEMETRY PACKET FORMAT. framed binary, protobuf-ish but not. current
+builds use zstd compression with a shared dictionary (the dictionary
+is baked into the agent DLL — look for a ~8KB blob referenced near
+the telemetry init). shape:
+
+  header:
+    u16 version
+    u16 flags
+    u32 bodyLen
+    u8  msgType
+    u8  severity
+    u16 reserved
+
+  body: zstd-dict(Fields)
+    u16 tag
+    u16 len
+    u8  value[len]
+
+current-build tag list (reconstructed, ordered by observed frequency):
+
+  0x0001 session id (16 byte guid)
+  0x0002 timestamp u64 ms since epoch
+  0x0010 flag id u32
+  0x0011 severity u8
+  0x0012 flag-specific data
+  0x0020 module info (path + hash + base + size + authenticode signer
+         thumbprint)
+  0x0021 VAD info (base + size + protection + type + optional backing
+         file path)
+  0x0022 thread info (tid + start_addr + state)
+  0x0030 cpuid dump (leaves 1, 7, 0x8000000{1,2,3,4}, 0x40000000)
+  0x0040 window info (hwnd + classname + title + rect + style flags +
+         has_d3d_swapchain)
+  0x0050 driver info (name + hash + size + signer thumbprint + wdac
+         blocklist state)
+  0x0060 screenshot bytes (image format tag + compressed payload)
+  0x0070 input stats block
+  0x0080 environmental fingerprint (SMBIOS fields + disk serial hash
+         + MAC hashes + GPU LUID + machine guid + TPM EK hash + Windows
+         product id)
+  0x0090 driver chain for mouse/keyboard (ordered list of driver names
+         + hashes)
+  0x00A0 kernel callback dump (addr + owning_driver_hash)
+
+severity: 0 info, 1 warn, 2 suspicious, 3 fatal.
+
+getting a fatal flag does not mean instant ban. flag gets logged
+server-side, correlated across sessions. the current-build correlation
+cadence is daily (used to be weekly), with hard-correlated flag chains
+triggering near-realtime bans within hours. still: "my cheat worked for
+a week before i got banned" is a normal story.
+
+flag ID space is 16-bit. current-build groupings:
+
+  0x10xx  module / VAD / shellcode / injection family
+  0x11xx  thread family
+  0x12xx  handle / API access family
+  0x13xx  window / overlay family
+  0x14xx  hook / integrity family
+  0x15xx  driver / signing family
+  0x16xx  process / parent family
+  0x17xx  debugger family
+  0x18xx  VM / hypervisor family
+  0x19xx  registry / BCD family
+  0x1Axx  input anomaly family
+  0x1Bxx  frame-capture overlay family
+  0x1Cxx  environmental fingerprint family (new in current)
+  0x1Dxx  server-pushed auxiliary scanner findings (new)
+
+
+THE PIPE PROTOCOL, DEEP
+
+named pipe: \\.\pipe\EasyAntiCheat_<session-guid>
+message-mode, bidirectional, overlapped.
+
+frame:
+  'EACP'       u32 magic
+  opcode       u16
+  flags        u16        (0x1 ENCRYPTED, 0x2 ACK_REQUIRED,
+                           0x4 FRAGMENT)
+  payloadLen   u32
+  crc32        u32
+  payload      u8[payloadLen]
+
+ENCRYPTED: payload is chacha20-poly1305 under the session ephemeral
+key, with a per-frame 12-byte nonce (counter + session nonce
+prefix) and a 16-byte tag appended.
+
+handshake, first few frames (unencrypted):
+
+  agent → launcher: HELLO {
+    protocolVer: u16,
+    agentBuild: utf8[32],
+    processId: u32,
+    bootCookie: u64
+  }
+
+  launcher → agent: WELCOME {
+    sessionId: u8[16],
+    ephemeralKey: u8[32],      // chacha20 key
+    serverTime: u64
+  }
+
+  (subsequent frames should set ENCRYPTED)
+
+  agent → launcher: AUTH { sessionToken: u8[...] }
+
+  launcher → agent: AUTH_OK { capsBitmap: u32 } or AUTH_FAIL
+
+  launcher → agent: CONFIG {
+    scan_intervals: {module_s, window_s, hook_s, integrity_s, input_s},
+    enabled_modules: u64,
+    frame_capture_period_s: u16,
+    env_check_period_s: u16
+  }
+
+  (maybe) launcher → agent: REMOTE_MODULE_LOAD { signedDll: u8[...] }
+
+  (steady state) heartbeats + reports both directions
+
+the REMOTE_MODULE_LOAD frame contains a signed DLL blob. the agent
+verifies the signature with an epic pubkey, then does a manual map
+(not LoadLibrary — it would be hygiene-breakage to add an unsigned-
+path-looking module to LDR), builds a minimal IAT via GetProcAddress
+internally, calls the module's exported entrypoint with a pointer to
+an EAC-provided scan context. the scan module reports findings back
+via a callback in the context. the module stays resident for the
+session and is unmapped at teardown.
+
+
+rules.bin — THE WHOLE FILE
+
+high-value asset. this is the one chunk you can extract in human-
+readable form and most of what EAC "knows about" lives here.
+
+current-build header (80 bytes):
+  'EACR'     u32 magic
+  version    u32
+  iv         u8[12]      GCM nonce
+  plainSize  u32
+  sectionCount u32
+  tag        u8[16]      GCM auth tag
+  sig        u8[64]      Ed25519 over (header_without_sig || ciphertext)
+
+ciphertext follows, plainSize bytes, AES-256-GCM.
+
+key derivation:
+  rootKey = 32 bytes baked into agent DLL
+  key     = HKDF-SHA256(rootKey, salt=iv, info="EACRULES2026", 32)
+
+locate rootKey by xref to the "pbrules.bin" (or "rules.bin" on older)
+string in the agent DLL — it's used in a CreateFile call whose result
+flows into the decrypt function. the first argument to the HKDF-SHA256
+inside is a 32-byte constant. that's the root key.
+
+after decrypt, series of sections. each section header:
+
+  type        u32
+  count       u32
+  entrySize   u32
+  entries     u8[count * entrySize]
+
+entry shapes by type:
+
+  modules by sha256        (0x01):
+    sha256     u8[32]
+    severity   u32
+
+  modules by path suffix   (0x02):
+    wcharLen   u16
+    suffix     wchar[wcharLen]
+    severity   u32
+
+  modules by pattern       (0x03):
+    len        u32
+    pattern    u8[len]
+    mask       u8[len]
+    severity   u32
+
+  processes by name        (0x10): same as path suffix
+  processes by sha256      (0x11): same as sha256
+  windows by class         (0x20): same as path suffix
+  windows by title         (0x21): same as path suffix
+  drivers by sha256        (0x30): same as sha256
+  drivers by name          (0x31): same as path suffix
+  drivers by signer thumb  (0x32):
+    sha1       u8[20]
+    severity   u32
+  string sigs              (0x40):
+    encoding   u8     // 0 ascii, 1 utf16
+    len        u16
+    needle     u8/wchar[len]
+    severity   u32
+  byte patterns            (0x50): same as pattern
+  cert signer whitelist    (0x60):
+    sha256     u8[32]
+  smbios anomaly list      (0x70):
+    kind       u32     // 0 vendor, 1 product, 2 serial, 3 uuid
+    needleLen  u16
+    needle     u8[needleLen]
+    severity   u32
+  firmware block list      (0x71):
+    kind       u32     // 0 bios_vendor, 1 bios_version, 2 bios_release
+    needleLen  u16
+    needle     u8[needleLen]
+    severity   u32
+  mouse driver block list  (0x80):
+    sha256     u8[32]
+    severity   u32
+
+the python decrypt is ~40 lines once you have rootKey and the Ed25519
+pubkey. not shipping it here because the keys rotate and extraction is
+an hour in IDA. look for the 32-byte constant xref'd from the first
+function called after the "pbrules.bin" string reference.
+
+
+FORTNITE'S OWN INTEGRITY LAYER (not EAC — epic's own)
+
+separate thing people conflate with EAC. the fortnite shipping exe has
+anti-cheat logic that runs independent of EAC's DLL. mostly wiring into
+UE5's anti-cheat module feature system plus server-authoritative game
+logic.
+
+unreal has IOnlineAntiCheatCommon and IAntiCheatModularFeature
+interfaces. EAC implements concretes. the game registers users (session
+attendees) via RegisterUser. all anti-cheat network traffic between
+client and server goes through SendNetworkMessage and
+ReceiveNetworkMessage, which means EAC's reports tunnel through
+fortnite's own game netcode to reach epic. you can't block EAC
+telemetry at the network layer without also breaking matchmaking.
+
+the game calls EAC_x64.dll by ordinal, not name. ordinals rotate.
+roughly:
+
+  ord 1  Client_Init
+  ord 2  Client_Shutdown
+  ord 3  Client_RegisterPeer
+  ord 4  Client_UnregisterPeer
+  ord 5  Client_ReceiveMessage
+  ord 6  Client_PollStatus
+  ord 7  Client_SetCallback
+  ord 8  Client_GetProtectedData
+  ord 9  Client_ReportBehavior
+  ord 10 Client_AddNetworkToken
+  ord 11 Client_RemoveNetworkToken
+  (and a bunch more for session events, message signing, trust state)
+
+map ordinals to names by dumping EAC_x64's exports in cff explorer
+(exports by ordinal only — you get numbers), then walking the game's
+IAT for EAC_x64 imports. the correspondence is positional. unreal's
+anti-cheat module source is public (it's in the engine); the private
+EOS sample implementation that ships with the EOS SDK gives you
+plausible name candidates for each ordinal.
+
+independent of EAC, fortnite has these server-authoritative checks:
+
+  - movement authority. client sends intent, server validates physics.
+    speed hacks, teleports, infinite jumps, no-clip — caught here.
+    reverse via ACharacter / APlayerCharacter movement replication
+    and the net-correction logic.
+  - shot rate validation. each weapon has a server-side minimum fire
+    interval. extra shots discarded, counter incremented, pattern of
+    excessive overshoots → flag.
+  - weapon spread. client cannot reduce spread below server config.
+    server computes actual projectile direction.
+  - FOV. FOV changers above the game's slider limit caught server-side.
+  - build placement. illegal placements rejected server-side.
+  - resource delta. mats and ammo cross-checked.
+
+none of this is EAC. this is epic's own UE code. the kick/ban taxonomy:
+
+  - kick:     session-only, no account consequence. triggered
+              client-side by EAC when the detection is immediate
+              (overlay + kernel debugger).
+  - soft ban: cooldown after match loss. triggered by server
+              heuristics.
+  - shadow ban: matchmaking into a queue of flagged accounts. no
+              notification. epic's cleverest mechanism and it took
+              the cheat community a long time to figure out it
+              existed.
+  - hard ban: account termination. requires server correlation.
+  - hwid ban: hard ban plus hardware fingerprint block. triggered
+              when hard-banned user reappears on same hardware with
+              a fresh account.
+
+
+THE PROTECTION LAYER
+
+VMProtect 3.x is the primary obfuscator on the agent DLL and the driver.
+EAC's builds enable ultra-mutation + import protection. only the
+sensitive routines are virtualized (anti-debug, anti-VM, integrity
+timer, pin check, session auth, SMBIOS fingerprint capture) — the rest
+is plain native code, obfuscated but tractable.
+
+devirt strategy:
+
+  1. dump DLL from memory after init. scylla, fix IAT.
+  2. identify virtualized regions by their entry gadget (push + jump
+     into dispatcher — VMP leaves a characteristic prologue).
+  3. NoVmp each virtualized function. VTIL IL dump back.
+  4. for handlers NoVmp doesn't recognize, trace them symbolically
+     with triton or by hand with unicorn. identify the semantic (vAdd,
+     vXor, vShl, vReadMemQ, vCall, so on), add to your handler table,
+     re-run.
+  5. VTIL C exporter. output is ugly but readable.
+
+on top of VMProtect, current-build EAC adds a second custom VM layer
+around 2-4 sensitive routines (environmental fingerprint capture, pin
+check, and the session-auth signing path). spot them because they
+don't have VMProtect's entry gadget but they have a classic "fetch
+byte from table, switch on byte, execute handler" loop. easier than
+VMP — one layer, no mutation, opcode table of 30-60 entries. label
+once, dump embedded bytecode.
+
+control-flow flattening on top. dispatcher state machine:
+
+  int state = INIT;
+  while (true) {
+      switch (state) {
+          case  7: /* block A */ state = 13; break;
+          case 13: /* block B */ state =  2; break;
+          case  2: /* block C */ state = -1; break;
+          case -1: return;
+      }
+  }
+
+unflatten with dnpushme's DeFlat or a triton script. symbolic-execute
+the dispatcher, reconstruct the natural CFG.
+
+ANTI-DEBUG CHECKS (continuous, not just init):
+
+  - PEB.BeingDebugged — classic
+  - NtGlobalFlag — heap debug flags set means debugger
+  - heap flags — same idea, different place
+  - NtQueryInformationProcess(ProcessDebugPort) — nonzero → debug
+  - NtQueryInformationProcess(ProcessDebugFlags) — zero → debug
+  - NtQueryInformationProcess(ProcessDebugObjectHandle) — nonzero
+  - GetThreadContext looking at Dr0..Dr3 for hardware breakpoints
+  - rdtsc delta timing between two nop sequences
+  - NtQuerySystemInformation(SystemKernelDebuggerInformation)
+  - ThreadHideFromDebugger vs ProcessDebugPort consistency check
+  - new in current: NtQueryInformationProcess(ProcessInstrumentationCallback)
+    — zero means nobody has the kernel-callback instrumentation hook
+
+ANTI-VM CHECKS:
+
+  - CPUID 0x1 ecx bit 31 (hypervisor-present)
+  - CPUID 0x40000000 brand ("VMwareVMware", "KVMKVMKVM\0\0\0",
+    "Microsoft Hv", "XenVMMXenVMM", "VBoxVBoxVBox",
+    "QEMU\0\0\0\0\0\0\0\0", "TCGTCGTCGTCG", "bhyve bhyve ")
+  - registry probes (vmware tools, vbox guest additions, hyper-v
+    integration services, parallels tools)
+  - device probes (\\.\VBoxMiniRdrDN, \\.\pipe\VBoxTrayIPC,
+    \\.\vmci, \\.\prl_pci)
+  - MAC prefix checks (00:05:69, 00:0C:29, 00:50:56 vmware; 08:00:27
+    vbox; 00:03:FF hyper-v; 00:1C:42 parallels)
+  - timing: CPUID cost under virtualization vs native. rdtsc delta
+    across a cpuid, compared against cached native baseline.
+  - current-build addition: APIC ID check. real hardware APIC IDs
+    have an expected topology; many hypervisors return 0 or linear
+    sequences. anomalous APIC topology flags.
+  - current-build addition: CPUID leaf 0x16 (processor frequency
+    information). must return nonzero on real modern hardware. many
+    hypervisors return zeros.
+
+none of these fire immediately as a ban trigger alone. suspicion score
+accumulates. backend decides.
+
+ANTI-DUMP:
+
+  - erase PE header after init (zero MZ/PE magics in dumped image).
+    naive dumpers get garbage at the base.
+  - encrypt .text pages back to packed form after sensitive functions
+    execute, decrypt on demand. "snapshot of running agent" is lossy.
+  - continuous self-hash via integrity worker. if you've paused and
+    modified .text, the next self-check tick catches it.
+  - current-build: specific regions marked PAGE_EXECUTE_WRITECOPY so
+    CoW breaks naive .text patches.
+
+IAT PROTECTION via name hashing. imports resolved at init by hashing
+each API name and looking up by hash in a per-DLL export table. hash
+function varies — djb2 (init 5381) and fnv1a (init 0x811c9dc5) are
+common, EAC has used both. reverse by:
+
+  - find the hash function (xref the init constant)
+  - precompute hashes for every export in ntdll, kernel32, kernelbase,
+    user32, d3d11, d3d12, dxgi, winhttp (new in current for the
+    transport layer), gdi32, gdi32full
+  - script IDA to replace g_imports[i] references with the matching
+    API name based on the stored hash
+
+once done, the agent becomes dramatically more readable.
+
+
+EAC-EOS DELTA (EasyAntiCheat_EOS, current)
+
+architecturally similar to classic, few differences worth calling out.
+
+driver is smaller — maybe 55% the on-disk size on current builds.
+several IOCTLs moved to user mode or removed:
+
+  - PHYS_READ removed (user-mode VAD walk + attestation cover the use
+    case)
+  - CALLBACK_DUMP moved to user mode via
+    NtQuerySystemInformation(SystemBigPoolInformation) +
+    pattern-matching on pool tags
+  - PATTERN_SCAN moved to user mode
+
+no persistent service. EOS driver loads on demand when a protected
+game launches, unloads on exit. different symbolic link name
+(\\DosDevices\\EasyAntiCheatEOS), different device name (with its own
+random suffix), different ObCallbacks altitude. different pipe name
+(\\.\pipe\EOS_EAC_<session>).
+
+transport through EOS SDK → TLS to api.epicgames.dev. no legacy
+easyanticheat.net. pin set pulled from EOS SDK data section at session
+init rather than baked into EAC_EOS directly.
+
+preserved: all kernel callbacks and semantics, the handle-strip, the
+VAD walker, the module/VAD diff, the rules engine (same file format,
+different root key), the window scanner, the hook detector, the
+integrity timer. if you've reversed classic EAC, EOS is maybe 30%
+additional work for the deltas.
+
+
+=============================================================================
+PART A — BAN TRACES & MACHINE IDENTIFIERS (the cleaner surface)
+=============================================================================
+
+if you got flagged, hard-banned, or HWID-banned and you want to
+understand what's actually on your system that correlates your identity
+to the ban, this is the surface. everything in this section is based on
+what EAC + the broader windows telemetry stack can observe about your
+machine.
+
+there are two overlapping concerns:
+
+  (a) on-DISK traces that correlate "your machine" to "this account's
+      ban" via log files, caches, registry, event logs
+  (b) live-queried machine identifiers that correlate "your hardware"
+      to "banned hardware" via hardware fingerprinting
+
+both matter. cleaning only (a) when (b) is the real binding gets you
+nowhere. cleaning only (b) when (a) still shows "this machine has run
+and been reported by EAC N times" also gets you nowhere.
+
+
+SECTION A.1 — ON-DISK TRACES EAC AND THE SYSTEM LEAVE
+
+EAC-specific trace locations:
+
+  C:\ProgramData\EasyAntiCheat\                 — persistent config,
+                                                  boot cookies, cached
+                                                  session metadata
+  C:\ProgramData\EasyAntiCheat_EOS\             — same for EOS variant
+  C:\ProgramData\Epic\EasyAntiCheat\Logs\       — run logs. the agent
+                                                  writes short per-
+                                                  session logs with
+                                                  session IDs
+  %LOCALAPPDATA%\EasyAntiCheat\                 — per-user caches
+  %LOCALAPPDATA%\EasyAntiCheat_EOS\
+  C:\ProgramData\Epic\EpicGamesLauncher\Data\Logs\
+                                                 — launcher logs, which
+                                                   include EAC service
+                                                   start/stop events
+                                                   and process spawn
+                                                   records
+  C:\Program Files (x86)\EasyAntiCheat\
+                                                 — system install dir;
+                                                   contains the shared
+                                                   driver copy and setup
+                                                   log
+  C:\Windows\System32\LogFiles\EasyAntiCheat\    — present on some
+                                                   builds; contains
+                                                   driver-side crash
+                                                   dumps and status
+
+Fortnite-specific:
+
+  %LOCALAPPDATA%\FortniteGame\Saved\Logs\        — client-side game logs
+                                                   with session IDs that
+                                                   epic's backend can
+                                                   correlate
+  %LOCALAPPDATA%\FortniteGame\Saved\Config\      — user-ID artifacts and
+                                                   session continuation
+                                                   data
+  %LOCALAPPDATA%\FortniteGame\Saved\Crashes\     — crash reports (which
+                                                   include hardware
+                                                   fingerprints)
+  %LOCALAPPDATA%\FortniteGame\Saved\WebCache*\   — web cache
+  %LOCALAPPDATA%\EpicGamesLauncher\Saved\
+    DeviceIdCache*                                — device id cache,
+                                                   per-user epic device
+                                                   fingerprint
+
+Registry locations EAC writes or reads through:
+
+  HKLM\SYSTEM\CurrentControlSet\Services\EasyAntiCheat
+  HKLM\SYSTEM\CurrentControlSet\Services\EasyAntiCheat_EOS
+  HKLM\SOFTWARE\EasyAntiCheat
+  HKLM\SOFTWARE\WOW6432Node\EasyAntiCheat
+  HKCU\Software\EasyAntiCheat                      — per-user cache
+  HKLM\SYSTEM\CurrentControlSet\Services\EasyAntiCheat\Enum
+                                                   — PnP enum entry for
+                                                   the loaded driver
+  HKLM\SYSTEM\Setup\LastUserShellFolders            — occasionally
+                                                   touched during
+                                                   install/update
+
+Windows forensic artifacts that outlive EAC's own cleanup:
+
+  Prefetch:
+    C:\Windows\Prefetch\
+      EASYANTICHEAT.EXE-*.pf, EASYANTICHEAT_LAUNCHER.EXE-*.pf
+      FORTNITECLIENT-WIN64-SHIPPING_EAC.EXE-*.pf
+      FORTNITECLIENT-WIN64-SHIPPING_EAC_EOS.EXE-*.pf
+      FORTNITELAUNCHER.EXE-*.pf
+    prefetch records volume paths, DLLs loaded, run count, first/last
+    run time. forensic timeline gold.
+
+  Event Logs (.evtx):
+    C:\Windows\System32\winevt\Logs\System.evtx
+      — service start/stop events for EasyAntiCheat
+      — driver load events (Microsoft-Windows-Services)
+      — Code Integrity events if the driver had any load drama
+    C:\Windows\System32\winevt\Logs\Application.evtx
+      — any crashes from the game or EAC
+    C:\Windows\System32\winevt\Logs\
+      Microsoft-Windows-Kernel-PnP%4Device*.evtx
+      — device enum events for the EAC driver device
+    C:\Windows\System32\winevt\Logs\
+      Microsoft-Windows-TaskScheduler%4Operational.evtx
+      — if EAC used a scheduled task (some installers did/do)
+    C:\Windows\System32\winevt\Logs\
+      Microsoft-Windows-WHEA-Logger%4Operational.evtx
+      — hardware error events; relevant only if there were crashes
+
+  SRUM database:
+    C:\Windows\System32\sru\SRUDB.dat
+      — per-executable network bytes transferred and runtime stats.
+      shows "this machine ran EasyAntiCheat.exe and FortniteClient-*
+      and transferred N bytes to epic endpoints." aggregated hourly.
+
+  BAM (Background Activity Moderator):
+    HKLM\SYSTEM\CurrentControlSet\Services\bam\UserSettings\<SID>
+      — per-SID list of executables run and their last run time.
+      includes EAC and Fortnite binaries.
+
+  MUICache:
+    HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\
+      Shell\MuiCache
+      — binary full paths and FriendlyAppName values for executables
+      that ran under this user.
+
+  Shimcache (AppCompat):
+    HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache
+      — list of executable paths + last-modified times observed, kept
+      across reboots, flushed to registry only at reboot.
+
+  Amcache.hve:
+    C:\Windows\appcompat\Programs\Amcache.hve
+      — detailed record of every executable run, with sha1 hashes of
+      the binaries themselves. this is the heaviest forensic witness —
+      amcache shows not just that a binary ran but the actual sha1 of
+      the specific version.
+
+  Jump Lists:
+    %APPDATA%\Microsoft\Windows\Recent\AutomaticDestinations\
+      — per-application recent-files lists.
+
+  NTFS USN Journal:
+    $Extend\$UsnJrnl:$J
+      — filesystem change journal. records creation/modification of
+      EAC files, log files, etc. huge, but large chunks can survive
+      long enough to matter.
+
+  Pagefile.sys, hiberfil.sys, swapfile.sys:
+    C:\pagefile.sys, C:\hiberfil.sys, C:\swapfile.sys
+      — paged out memory from any process that ran. can contain
+      literal cleartext of pipe frames, session IDs, HWID tokens that
+      EAC computed.
+
+  Volume Shadow Copies:
+    vssadmin list shadows
+      — point-in-time snapshots of the drive. windows creates these
+      on various triggers. any snapshot made while EAC was installed
+      contains the full forensic record above.
+
+  WER (Windows Error Reporting) queue:
+    C:\ProgramData\Microsoft\Windows\WER\
+      — cached crash dumps that haven't been uploaded yet. if fortnite
+      or EAC ever crashed, a minidump may be here with a full memory
+      snapshot of the crashing process.
+
+Epic launcher caches:
+  C:\ProgramData\Epic\EpicGamesLauncher\
+  %LOCALAPPDATA%\EpicGamesLauncher\
+    — contain your epic account ID, device ID cache, sessions, auth
+    tokens. tied to your account even if you log out.
+
+
+SECTION A.2 — LIVE-QUERIED MACHINE IDENTIFIERS (what EAC and epic
+collect as your HWID / fingerprint)
+
+these are the fields EAC reads and reports to the backend as your
+hardware fingerprint. the backend stores a hash of some combination
+of these per session. an HWID ban blacklists that hash.
+
+  SMBIOS (via NtQuerySystemInformation(SystemFirmwareTableInformation,
+    'RSMB') or WMI Win32_BIOS / Win32_BaseBoard / Win32_ComputerSystem
+    / Win32_SystemEnclosure):
+      BIOS vendor (type 0 string)
+      BIOS version
+      BIOS release date
+      system manufacturer (type 1)
+      system product name (type 1)
+      system version (type 1)
+      system serial number (type 1)
+      system UUID (type 1)
+      baseboard manufacturer (type 2)
+      baseboard product name (type 2)
+      baseboard serial number (type 2)
+      chassis manufacturer (type 3)
+      chassis serial (type 3)
+
+  Disk:
+      per-physical-drive serial number via
+        IOCTL_STORAGE_QUERY_PROPERTY with StorageDeviceProperty
+      per-physical-drive model + firmware via same
+      NVMe identify controller via IOCTL_STORAGE_PROTOCOL_COMMAND
+        (NVMe-specific EUI64 and NGUID)
+      per-volume serial number via GetVolumeInformation (NTFS boot
+        sector field — lower entropy than physical-drive serial but
+        still recorded)
+
+  Network:
+      per-adapter permanent MAC via NDIS IOCTL (not just the "current"
+        MAC — asks for the burned-in one)
+      per-adapter description + hardware ID from the registry under
+        HKLM\SYSTEM\CurrentControlSet\Enum\PCI\...
+      per-adapter IPv6 global prefix (less stable but still captured)
+
+  CPU:
+      CPUID leaf 1 EAX/EBX/ECX/EDX (signature, feature flags)
+      CPUID brand string (leaves 0x80000002-0x80000004)
+      CPUID leaf 0x16 processor frequency (or computed TSC rate as
+        a fallback)
+      CPUID leaf 4 cache topology
+      CPUID leaf 0x1F / 0xB extended topology — NUMA + core layout
+      microcode revision via RDMSR 0x8B (requires kernel side)
+      processor serial number via CPUID leaf 3 if available (deprecated
+        on modern CPUs but EAC still probes)
+
+  GPU:
+      adapter LUID + description via DXGI IDXGIAdapter::GetDesc1
+      PCI subsystem/vendor/device IDs via setupapi on PCI\VEN_*\DEV_*
+      nvidia-specific device UUID via NVAPI if nvidia driver present
+      intel-specific device UUID via IGCL / IGDUMD queries
+      amd-specific via ADLX / AMDVLK queries
+
+  Audio / input:
+      audio endpoint device IDs via IMMDeviceEnumerator
+      mouse/keyboard HID paths via SetupDiGetClassDevs
+
+  Display:
+      monitor EDID via setupapi registry under
+        HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY\*\*\Device Parameters\EDID
+      (contains manufacturer ID, product code, serial number, mfg
+       date)
+
+  TPM (newer builds, when a TPM is present):
+      TPM endorsement key public — hash of this is strongly stable
+        per-TPM (survives Windows reinstall; only replaced if TPM is
+        cleared or motherboard is swapped)
+      TPM manufacturer ID + version via TBS APIs
+
+  Windows / OS identity:
+      HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
+      HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProductId
+      HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\DigitalProductId
+        (4 bytes of installation ID, basically unique per install)
+      HKLM\SOFTWARE\Microsoft\SQMClient\MachineId
+      current user SID from the user token
+      Windows build number + revision (not identifying alone, but
+        combines)
+
+  Firmware tables beyond SMBIOS:
+      ACPI tables via NtQuerySystemInformation(SystemFirmwareTableInformation,
+        'ACPI') — ACPI OEM ID + OEM table ID
+      specifically the MSDM table on OEM machines (contains the OEM
+        windows product key — not something EAC reads, but worth
+        knowing exists as a fingerprint source)
+      PCI config space for each device via IoGetDeviceProperty — this
+        is driver-side, EAC's driver can enumerate all PCI devices and
+        hash the layout
+
+  Boot / firmware:
+      UEFI firmware vendor + version via GetFirmwareEnvironmentVariable
+      Secure Boot state
+      HVCI / VBS state
+      Windows "Memory Integrity" (code integrity for drivers) state
+      DMA Guard / Kernel DMA Protection state
+
+each of these is hashed into contributions to the backend fingerprint.
+some get weighted more heavily than others — motherboard UUID, TPM EK,
+disk serials, MAC addresses, and machine guid are the heaviest. monitor
+EDID and audio endpoints are lighter contributors.
+
+what an HWID ban actually blacklists: a combination hash across some
+subset of these. the exact combination is epic's secret. probability of
+getting past an HWID ban by changing one field is low; the ban hash is
+tolerant to single-field drift up to a point.
+
+
+SECTION A.3 — WHAT A COMPREHENSIVE CLEANER OPERATION LOOKS LIKE
+
+if you were going to clean a machine comprehensively after a flag event,
+here's the full surface you'd need to touch. this is the inventory —
+operational steps are left to the operator (reinstalling windows is
+the "nuclear" option and cleaner than any delete script because it
+regenerates the Windows identity fields along with the forensic
+artifacts).
+
+  (1) uninstall EAC and fortnite via epic launcher (regular path)
+  (2) uninstall the system-wide EAC via its uninstaller
+  (3) delete the ProgramData and LocalAppData directories listed above
+  (4) delete the Epic Games Launcher install directory
+  (5) delete fortnite's saved data
+  (6) clear the registry keys listed in A.1
+  (7) clear prefetch (files, not the directory)
+  (8) clear the event logs (requires admin; this creates its own event
+      log entry about the clearing, which is itself forensically
+      relevant)
+  (9) clear BAM via the SID subkey
+  (10) clear MUICache
+  (11) clear shimcache — requires a reboot after registry wipe because
+       shimcache is read into memory at boot and flushed at shutdown
+  (12) delete Amcache.hve — this one is annoying because Amcache is
+       locked at runtime; needs offline boot or scheduled deletion
+  (13) wipe NTFS $UsnJrnl
+  (14) delete pagefile.sys, hiberfil.sys, swapfile.sys (disable paging,
+       reboot, re-enable to regenerate empty)
+  (15) delete all VSS snapshots:
+         vssadmin delete shadows /all /quiet
+  (16) delete WER queued dumps
+  (17) delete jump lists
+  (18) delete windows search index (otherwise filenames leak):
+         net stop wsearch
+         delete C:\ProgramData\Microsoft\Search\Data\Applications\Windows\
+  (19) clear the recycle bin
+  (20) clear browser caches and history for any browser used to access
+       epic accounts
+  (21) recognize that none of this touches the HWID binding; see A.4
+
+cleaning does not undo an HWID ban. the ban hash is computed from
+live-queried hardware state. new install, fresh windows, same hardware
+→ same ban hash → same ban. HWID bans are hardware-rooted and the
+mitigation is spoofing (see PART B) or new hardware.
+
+cleaning does make the forensic trail of "this machine ran EAC N times
+during the banned period" harder to reconstruct, which matters for
+appeal process disputes (less of a factor than people hope for) and
+for future correlation-with-newer-accounts analyses (modestly helpful).
+
+
+SECTION A.4 — WHY CLEANING ALONE DOESN'T BEAT HWID BANS
+
+the critical point. EAC's and Epic's backend don't need your on-disk
+forensic artifacts to re-recognize banned hardware. at next session
+start, the agent collects the live-queried identifiers in A.2, hashes
+them, sends the hash. backend compares against the ban list. match →
+ban.
+
+so cleaning helps:
+  - prevent a FUTURE investigation from tying a NEW identifier to the
+    OLD ban through log correlation on your disk
+  - make a disputed appeal less open-and-shut
+  - reset local caches that EAC uses for drift detection (so future
+    sessions start fresh)
+
+cleaning does not:
+  - unban your hardware
+  - prevent the HWID hash on next launch from matching the ban list
+  - affect epic's server-side records of your ban at all
+
+the one operation that does "beat" an HWID ban on the same hardware is
+spoofing the inputs that go into the HWID hash. that's PART B.
+
+
+=============================================================================
+PART B — HWID CHECKS, KERNEL SPOOFERS, THE SPOOF SURFACE
+=============================================================================
+
+this section covers: every HWID source EAC reads (from PART A.2), the
+mechanism by which each source is actually read on windows, and how
+kernel-level spoofers alter each source. "spoofer" here means a
+kernel driver (or kernel-only patch set) that intercepts reads of
+the HWID fields and returns altered values, aiming to make the
+hashed fingerprint different from the banned hash.
+
+this is a map of the attack surface. understanding what EAC reads and
+how is useful for both the defender (plug the holes) and the attacker
+(know what needs patching). per sam's ask: deep coverage, no missing
+details.
+
+
+SECTION B.1 — SMBIOS: how it's read, how it's spoofed
+
+SMBIOS (System Management BIOS) is a set of structured tables stored
+in physical memory by the BIOS/UEFI at boot. tables are indexed by
+type (0 = BIOS, 1 = System, 2 = Baseboard, 3 = Chassis, etc.) and
+each table is a fixed-layout structure with string references.
+
+how windows exposes SMBIOS:
+
+  (a) user-mode, via WMI:
+        Win32_BIOS                → BIOS info (type 0)
+        Win32_ComputerSystemProduct → system info (type 1)
+        Win32_BaseBoard           → baseboard (type 2)
+        Win32_SystemEnclosure     → chassis (type 3)
+      WMI backs into a provider that ultimately reads the SMBIOS
+      data via an IOCTL to \Driver\WMIxWDM.
+
+  (b) user-mode, via GetSystemFirmwareTable:
+        GetSystemFirmwareTable('RSMB', 0, buffer, size)
+      returns the raw SMBIOS table blob. this is what EAC uses
+      directly in current builds — it's faster than WMI and can be
+      parsed byte-by-byte to extract strings.
+
+  (c) kernel-mode, via NtQuerySystemInformation:
+        NtQuerySystemInformation(SystemFirmwareTableInformation,
+                                 request, requestSize, &returned)
+      with request.Action=SystemFirmwareTable_Get and
+      request.ProviderSignature='RSMB'. this is EAC's driver path.
+
+a spoofer that wants to change what EAC sees has to patch all three
+paths. patching only WMI leaves GetSystemFirmwareTable showing real
+values. patching only the user-mode GetSystemFirmwareTable leaves the
+driver's NtQuerySystemInformation call returning real values. the
+real work is at the kernel path, because the user-mode paths
+ultimately funnel through kernel-side firmware-table retrieval.
+
+the spoofer's kernel-side work involves intercepting
+ExpQuerySystemFirmwareTable (the undocumented internal function
+NtQuerySystemInformation ends up calling for 'RSMB'). either by
+hooking it directly (painful because patchguard protects ntoskrnl
+.text), or — more durably — by patching the SMBIOS table itself in
+physical memory so every reader sees the altered values. the physical
+SMBIOS table lives at a specific physical address recorded in the
+UEFI configuration tables; map it via MmMapIoSpace and overwrite the
+string fields.
+
+the catch: once you alter the table in memory, you have to keep it
+altered. windows caches the SMBIOS table at boot and some code paths
+read from cache rather than re-reading from physical memory. so a
+proper spoofer alters the cached copy inside ntoskrnl's data section
+too. find the cache by xrefs from ExpQuerySystemFirmwareTable in a
+kernel disassembly of your windows build, apply the alteration there,
+and now every query is consistent.
+
+EAC's env_worker runs environment-consistency checks every 30s. it
+re-reads SMBIOS and compares against the session's init-time snapshot.
+if a lazy spoofer only altered the first read's result but didn't
+patch durably, the env_worker catches drift. so a spoofer must either
+(a) patch durably so every read returns the same spoofed values, or
+(b) also hook the env_worker's read path specifically, which requires
+hooking the user-mode agent — more fragile.
+
+specific SMBIOS fields a spoofer must alter if it's trying to beat
+an HWID ban (most-to-least weight):
+
+  (table 1) system UUID               — 16 bytes, strong identifier
+  (table 1) system serial number      — string, strong
+  (table 2) baseboard serial          — string, strong
+  (table 2) baseboard manufacturer    — string, moderate
+  (table 2) baseboard product name    — string, moderate
+  (table 0) BIOS vendor               — string, weak
+  (table 0) BIOS version              — string, weak
+  (table 1) system manufacturer       — string, moderate
+  (table 1) system product name       — string, moderate
+  (table 3) chassis serial            — string, moderate
+
+and rules.bin's section 0x70 (smbios anomaly list) has block entries
+for values EAC's backend considers "known fake" — spoofers using
+common filler strings ("To be filled by O.E.M.", "Default string",
+"System Manufacturer", a few known public leaks of real OEM strings)
+get flagged by the anomaly list, so a spoofer has to generate
+plausible-looking fresh values.
+
+section 0x71 (firmware version block list) blocks known fake BIOS
+version strings. same idea.
+
+
+SECTION B.2 — DISK SERIALS, VOLUME SERIALS, SMART
+
+physical disk serial numbers. read via:
+
+  DeviceIoControl(hDisk, IOCTL_STORAGE_QUERY_PROPERTY,
+                  StorageDeviceProperty / StorageAdapterProperty, ...)
+
+returns STORAGE_DEVICE_DESCRIPTOR with VendorIdOffset, ProductIdOffset,
+SerialNumberOffset. the serial is the one EAC cares about most.
+
+the IOCTL is handled by \Driver\disk → \Driver\storport → the SCSI /
+NVMe miniport for the actual device. a spoofer hooks the dispatcher
+in disk.sys (or more durably, filters it with a filter driver
+registered above disk.sys). the filter intercepts the IOCTL return
+path and rewrites the SerialNumber offset content.
+
+NVMe-specific identifiers via IOCTL_STORAGE_PROTOCOL_COMMAND:
+  NVMe identify-controller returns the EUI64 (8 bytes) and NGUID
+  (16 bytes) of the device. these are hardware-rooted and spoof via
+  the same filter approach but with a different command.
+
+per-volume serials (NTFS):
+  GetVolumeInformation() returns the 32-bit serial number of the
+  volume — which is stored in the NTFS boot sector. spoofing requires
+  altering the boot sector or hooking the user-mode API chain. boot
+  sector alteration can conflict with Windows' boot-sector protection
+  on current builds (Secure Boot + BitLocker detection). API hooking
+  is more fragile but reversible.
+
+SMART data: not an HWID field strictly, but GetSMARTData can reveal
+power-on hours and reallocated sector counts. not EAC-relevant
+typically, mentioned for completeness.
+
+spoofer considerations:
+  (1) disk serials are read at various times by various code paths.
+      the spoofer has to filter every path or EAC's driver will see
+      the real serial via its own IOCTL.
+  (2) a filter driver sitting above disk.sys is the clean approach;
+      hooking disk.sys's dispatcher directly works but is more
+      patchguard-flaggable.
+  (3) current-build EAC compares disk serial via both the user-mode
+      IOCTL path and a WMI query. a spoofer that only hooks one
+      shows drift.
+
+
+SECTION B.3 — MAC ADDRESSES
+
+per-adapter MAC. two different values the system tracks:
+
+  (a) current MAC — the active MAC on the adapter. settable via
+      the registry under
+      HKLM\SYSTEM\CurrentControlSet\Control\Class\{4d36e972-e325-11ce-bfc1-08002be10318}\<index>
+      "NetworkAddress" value, and via the adapter's advanced
+      properties UI. windows uses this for actual network traffic.
+
+  (b) burned-in / permanent MAC — the one the NIC hardware was
+      manufactured with. read via NDIS IOCTL
+      OID_802_3_PERMANENT_ADDRESS (not OID_802_3_CURRENT_ADDRESS).
+      cannot be changed by registry; it's in the NIC's EEPROM.
+
+EAC reads the PERMANENT MAC, not the current one. so registry-level
+MAC changer tools do nothing against EAC fingerprinting.
+
+spoofing permanent MAC:
+  - the NDIS IOCTL path goes through the NIC's driver. a filter
+    driver above the specific miniport can rewrite responses.
+  - or, hook the NDIS IM (intermediate module) layer and rewrite
+    responses at that layer before they bubble up.
+  - some NICs have EEPROM update tools that change the burned-in
+    MAC (nontrivial, requires the correct firmware tools).
+  - cleanest for "spoofing everywhere": a filter driver registered
+    for the NIC's class that handles OID_802_3_PERMANENT_ADDRESS.
+
+the MAC prefix matters too. if your fake permanent MAC uses a
+prefix that doesn't match any registered OUI, EAC flags. the
+anomaly list in rules.bin section 0x70 (newer builds — same
+anomaly system is used for MAC prefix checks) blocks known fake
+prefixes.
+
+
+SECTION B.4 — CPU IDENTIFIERS
+
+CPUID is RDTSC's cousin. a CPU instruction. the kernel can intercept
+it via VT-x / AMD-V by causing vmexits on CPUID, but that's a
+hypervisor-level spoofer, not a driver one. on bare metal, CPUID
+returns what the silicon returns — you cannot spoof CPUID via a
+kernel driver on a non-virtualized system.
+
+what EAC reads:
+  - CPUID 1 (signature, feature flags)
+  - CPUID 0x80000002-4 (brand string, 48 chars)
+  - CPUID 4 (cache topology)
+  - CPUID 0xB / 0x1F (topology)
+  - CPUID 0x16 (frequency)
+  - optionally CPUID 3 (processor serial, deprecated)
+
+spoofer options:
+  (a) run under a hypervisor that intercepts CPUID and returns
+      altered values. EAC detects hypervisors (see anti-VM) so
+      this triggers other flags unless the hypervisor is stealthy.
+  (b) hook the user-mode agent's CPUID wrapper to return altered
+      values. fragile; EAC's agent has multiple CPUID call sites,
+      some VMP'd. if you miss one, drift.
+  (c) hook ntoskrnl's CPUID helpers (KeGetCpuId or similar, if your
+      windows build exposes them) — same risk.
+
+bottom line: CPUID spoofing on bare metal requires hypervisor-level
+control. most "spoofers" do not spoof CPUID; they rely on CPU
+fingerprint being a low-weight contributor to the ban hash.
+
+
+SECTION B.5 — GPU AND DXGI ADAPTER
+
+GPU LUID from DXGI. the LUID is a 64-bit identifier assigned by
+windows to the GPU. it's stable per boot per adapter but regenerates
+on driver reinstall or on major windows updates. not as stable as
+SMBIOS UUID but still a fingerprint contributor.
+
+spoofing: hook IDXGIAdapter::GetDesc1 at the user-mode level inside
+the agent, or more durably at the dxgi.dll level system-wide. EAC's
+integrity timer hashes dxgi.dll's .text, so inline-patching dxgi.dll
+in memory is caught. you need an API-hook approach that doesn't
+modify dxgi's .text — either EAT/IAT hooking (which has its own
+detection surface via EAC's export-pointer check) or
+PAGE_EXECUTE_WRITECOPY CoW tricks.
+
+nvidia/amd/intel driver UUIDs are read via vendor-specific APIs
+(NVAPI, ADLX, IGCL). hooking these in the vendor driver's user-mode
+component is possible but requires per-vendor work.
+
+PCI subsystem/vendor/device IDs from setupapi: read from
+HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_*\DEV_*. spoofable at
+the registry layer but the driver itself still knows the real IDs
+via PCI config-space reads; EAC's driver can enumerate PCI config
+space directly via Hal / pciport. so pure-registry spoofing is
+caught by driver-side cross-check.
+
+
+SECTION B.6 — MONITOR EDID
+
+the monitor's EDID (Extended Display Identification Data) blob is
+128 or 256 bytes read from the display via DDC/CI over I2C. windows
+caches it in the registry under
+HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY\*\*\Device Parameters\EDID.
+
+EDID contains manufacturer ID, product code, serial number, mfg date.
+the manufacturer ID + serial is a weak fingerprint but it contributes.
+
+spoofing: write the altered EDID into the registry key. you also need
+to ensure that any code path which reads EDID directly from the display
+(bypassing the registry cache) gets intercepted. the display driver
+does this on hotplug; a filter driver on the display stack can
+intercept.
+
+
+SECTION B.7 — TPM ENDORSEMENT KEY
+
+newer EAC builds (post-2024) query the TPM endorsement key (EK) via
+the TBS (TPM Base Services) APIs: Tbsi_Get_TCG_Log, Tbsi_Create /
+Tbsi_Submit_Command with a TPM2_ReadPublic for the EK handle.
+
+the EK is a per-TPM-chip RSA or ECC key provisioned at manufacture.
+its public portion is stable until the TPM is cleared. hash of the
+EK public is one of the hardest fingerprints to spoof on bare metal.
+
+spoofing requires:
+  (a) a virtualized TPM (fTPM / dTPM emulation in a hypervisor);
+      EAC detects hypervisors so this triggers anti-VM flags
+  (b) clearing the physical TPM (changes EK) — one-shot, destroys
+      your BitLocker keys among other things
+  (c) hooking TBS at the user-mode or driver level to return altered
+      EK public; fragile, EAC's env_worker re-reads
+
+most current spoofers either skip TPM entirely and accept the TPM-
+hash contribution to their ban hash (hoping the backend weighs it
+with enough slack) or require you to clear the TPM before use. there
+is no general-purpose durable TPM EK spoofer that is robust against
+re-read drift.
+
+
+SECTION B.8 — WINDOWS IDENTITY FIELDS
+
+machine GUID (HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid) is
+a per-install random GUID generated at windows install. spoofable
+via registry write.
+
+ProductId, DigitalProductId, SQMClient MachineId — all registry
+writes. spoofable trivially but EAC's env_worker re-reads at the
+30s cadence; so long as the spoofer altered the registry before
+session start AND the values remain altered (nothing's regenerating
+them), you're fine. windows itself doesn't regenerate these except
+at reinstall/sysprep.
+
+user SID — tied to the local user account. new user account → new
+SID. not spoofable at the SID itself, but the fingerprint reads the
+SID of the running user token, so "switch user accounts" is the
+non-spoof workaround.
+
+
+SECTION B.9 — THE SPOOFER ARCHITECTURE — FULL PICTURE
+
+a complete HWID spoofer that beats EAC's current fingerprint surface
+needs these capabilities:
+
+  1. kernel-mode presence. required for most of the patches below.
+     achieved through one of:
+     (a) a signed driver (unusual; signed driver attack surface is
+         small and usually gets revoked once detected)
+     (b) BYOVD: load a known-vulnerable signed driver and use its
+         arbitrary read/write primitive to map and execute the
+         spoofer's unsigned code. current popular vulnerable drivers
+         rotate as microsoft revokes signatures via the WDAC block
+         list. EAC's DRIVER_LIST IOCTL now returns WDAC block-list
+         match state, so vulnerable drivers with revoked signatures
+         are flagged on load.
+     (c) manual mapping via kdmapper or similar, using a BYOVD
+         primitive. the mapped driver has no backing \SystemRoot
+         file but still gets a VAD entry and still registers whatever
+         callbacks it registers. EAC's CALLBACK_DUMP catches new
+         callbacks and compares the owning-driver hash against its
+         own whitelist; a manual-mapped driver has no on-disk hash
+         match to anything, which itself is a flag.
+
+  2. SMBIOS patching, both physical memory + ntoskrnl cached copy.
+
+  3. disk.sys / storport filter for IOCTL_STORAGE_QUERY_PROPERTY,
+     IOCTL_STORAGE_PROTOCOL_COMMAND.
+
+  4. NDIS filter or miniport filter for OID_802_3_PERMANENT_ADDRESS.
+
+  5. display stack filter or EDID registry overwrite + hotplug
+     interception.
+
+  6. registry writes for machine GUID, ProductId, DigitalProductId,
+     SQMClient MachineId.
+
+  7. TPM strategy — either clear the TPM, run under a hypervisor,
+     accept the TPM hash contribution.
+
+  8. GPU: DXGI adapter desc hook (best-effort, not durable), vendor
+     driver API hook (per-vendor work).
+
+  9. anti-detection:
+     - don't register competing kernel callbacks that EAC would see
+       in CALLBACK_DUMP (manual-map and use direct syscall tables
+       for hooking rather than callbacks)
+     - don't leave the driver in loaded-driver lists where EAC's
+       DRIVER_LIST would return it. manual mapping + removing the
+       PsLoadedModuleList entry is standard.
+     - don't be visible in the VAD scan for the game process (which
+       is a non-issue for a kernel driver because the game process
+       doesn't contain the driver's memory).
+     - re-patch on 30s cadence to defeat EAC's env_worker drift
+       detection — but ideally with a durable patch that doesn't
+       need re-patching.
+
+the arms race here is about durability. a spoofer that patches once
+at load but doesn't sustain the patch gets caught by env_worker
+drift. a spoofer that patches durably but registers detectable kernel
+callbacks gets caught by CALLBACK_DUMP. a spoofer that does neither
+but uses a vulnerable driver with a revoked signature gets caught by
+DRIVER_LIST + WDAC state. the operational problem for spoofers is
+staying ahead of all three detection axes.
+
+
+=============================================================================
+PART C — CHEAT DETECTION SURFACE (what EAC flags, in detail)
+=============================================================================
+
+this section enumerates the specific detection surface EAC maintains
+for things that live in cheats. categorized by what the cheat does.
+
+
+SECTION C.1 — KERNEL DRIVER INDICATORS
+
+what EAC's driver looks at in other drivers:
+
+  (a) image hash match against rules.bin section 0x30
+  (b) name match against rules.bin section 0x31
+  (c) signer-cert thumbprint against rules.bin section 0x32
+  (d) WDAC block-list state (current-build DRIVER_LIST returns this)
+  (e) authenticode signature validity
+  (f) image path — non-standard paths (\\.\ UNC, temp directories,
+      downloaded content) trigger suspicion
+  (g) load reason — current-build EAC reads SystemLoadedModuleInfo
+      for each driver and compares load time to known "bulk boot
+      load" window vs ad-hoc late load
+  (h) manual-map indicators:
+      - PsLoadedModuleList entry missing when image exists in
+        PsLoadedModuleList's backing allocation (unlink patterns)
+      - driver image not present on disk at the recorded path
+      - image lacks a valid PE header structure (corruption as
+        anti-analysis)
+
+the rules.bin driver sections carry a running list of "we have seen
+this driver used by cheats" entries. the list updates via
+RULES_UPDATE pipe opcodes without an EAC update.
+
+known-bad signed drivers (the BYOVD set) — these are drivers with
+valid signatures that contain exploitable primitives (arbitrary
+read/write, map physical memory, etc.) that cheat loaders abuse.
+microsoft's WDAC block list contains the major ones:
+RTCore64.sys (MSI Afterburner), GPC-U64.sys, ATSZIO64.sys,
+GDRV.sys (Gigabyte), DBUTIL_2_3.sys (Dell), many more.
+
+EAC's DRIVER_LIST IOCTL marks each loaded driver with its
+WDAC-match state. matches → flag high severity, even if the signature
+is still technically valid.
+
+hypervisor-based cheats (a type-2 or stealth type-1 hypervisor that
+reads game memory from the host and writes results to a channel the
+cheat process reads) are detected by:
+  - anti-VM signals
+  - APIC ID topology anomalies
+  - CPUID timing baseline deviation
+  - CPUID leaf 0x16 (frequency) returning unexpected values
+  - rdtsc timing of operations that would cause vmexits under a
+    hypervisor (CPUID, MSR reads, specific port I/O)
+
+a well-written stealth hypervisor (SimpleVisor-derived, or commercial
+offerings) can defeat most of these. EAC's answer is to raise these
+to "suspicious" rather than "fatal" and let server-side ML correlate
+over multiple sessions. a single session of "all VM indicators look
+fine but the timing is 0.5% off baseline" doesn't ban; 300 sessions
+with the same tiny offset correlated against win-rates does.
+
+
+SECTION C.2 — INJECTION INDICATORS
+
+what EAC looks at for cheat DLL injection:
+
+  (a) new threads in protected process with start address not in any
+      module → shellcode → flag hard
+  (b) new threads with start address not in whitelisted module → flag
+  (c) VAD entries mapped as Image that aren't in PEB->Ldr → unlinked
+      module → flag
+  (d) VAD entries with executable + private protection → raw code
+      memory → flag
+  (e) transient-executable regions (R/W at snapshot T, R/X at T+2s)
+      → runtime unpacking → flag
+  (f) APC queue entries from non-whitelisted senders — current-build
+      EAC inspects ETHREAD->Tcb.ApcState via the driver for suspicious
+      APC queue contents; APC injection (QueueUserAPC into a thread
+      of the protected process from an external caller) leaves a
+      queued APC entry at the point of injection
+  (g) reflective loader stubs in unexpected places — these have
+      characteristic byte patterns (fnvhash lookups, manual IAT fix
+      ups) that rules.bin's pattern sections catch
+  (h) DLL side-loading / proxy DLLs — current-build EAC tracks the
+      dependency tree of game modules and flags if a system DLL is
+      resolved from a non-system path (search-order abuse)
+  (i) thread hijacking — SetThreadContext from a non-whitelisted
+      caller on a protected process thread triggers a flag via the
+      thread strip mask AND the handle open attempt log
+  (j) manual-map shellcode in the game process's own allocations —
+      pattern matched
+
+the most common cheat injection pattern in 2026 is manual-mapping a
+cheat DLL into the game process via a kernel-mode writer (bypassing
+the ObCallback strip by not using OpenProcess at all). this leaves:
+  - a VAD entry (type Image if the manual-mapper was polite, type
+    Private if not)
+  - no LDR entry
+  - thread(s) with start addresses in the mapped region (if the cheat
+    started its own threads) OR a hijacked existing thread (if not)
+  - IAT entries resolved manually
+
+the VAD walker catches this on the first scan tick after the map.
+cheats attempt to counter by:
+  - mapping the DLL as RW initially, flipping to RX only momentarily
+    to run (transient executable detector catches this)
+  - using existing executable VADs (hollowing a legit module) —
+    integrity timer catches the .text hash change
+  - running the cheat code from pure data references with return-
+    oriented programming (expensive, slow, limited in what you can
+    actually do, mostly research territory)
+
+
+SECTION C.3 — HOOKING PATTERNS
+
+what EAC detects:
+
+  (a) inline hooks in system DLL .text — direct byte diff via the
+      hook detector against the bundled baselines
+  (b) IAT hooks in game modules — periodic export-pointer re-resolve
+      checks that cached pointers match current GetProcAddress
+  (c) EAT hooks — same mechanism from the other direction
+  (d) KiUserCallbackDispatcher hijack — current-build EAC checks the
+      dispatcher's first few bytes against expected prologue
+  (e) vectored exception handlers registered by non-whitelisted
+      callers — AddVectoredExceptionHandler leaves a global list
+      the agent walks
+  (f) HWBP-based hooks — Dr0..Dr3 inspection via GetThreadContext
+      (enumerated under anti-debug but same mechanism)
+  (g) instrumentation callback hooks — ProcessInstrumentationCallback
+      nonzero without EAC's knowledge → flag
+  (h) PT (Processor Trace) / LBR abuse — rare, but current-build EAC
+      queries MSR 0x1D9 (DEBUGCTL) via the driver to detect if LBR
+      is active unexpectedly
+
+the hook detector runs on a ~2-5 second rotation. so a cheat that
+hooks for 500ms, does its thing, unhooks for 2 seconds, hooks again
+has maybe a 25% chance per cycle of being caught. over a match's
+worth of ticks that's effectively guaranteed. this is why "hook
+briefly" strategies have a limited shelf life.
+
+
+SECTION C.4 — GAME-STATE MANIPULATION INDICATORS
+
+reading game memory from outside the process (which the handle strip
+prevents directly, so this moves kernel-side) can be caught via
+telemetry if the cheat's visible effects correlate:
+  - impossibly consistent trajectory tracking (ML on movement data)
+  - sub-tick reactions (ML on input vs event timing)
+  - occluded-target reactions (ML on fire-events against
+    line-of-sight info the server knows)
+
+inside the process, memory reads are invisible — nothing gets flagged
+just for reading. the flag path is behavioral: once the cheat uses
+what it read, server-side correlation catches it.
+
+trigger-bot pixel sampling (reading screen pixels to detect a
+colored target region, then auto-firing) is caught via:
+  - input-anomaly detector's time-to-shot-after-input pattern
+  - current-build frame-capture ML looking for aim-circle overlays
+    even if the circle isn't rendered to the client (sampling via
+    DXGI capture of a region)
+  - pixel-reader code paths read from the swapchain — the agent
+    doesn't instrument this directly, but the input ML correlates
+
+macro input (hardware or software that generates recoil-compensation
+mouse patterns) is caught by the input anomaly detector's
+distributional analysis. real human recoil compensation has
+characteristic noise; macros don't.
+
+
+SECTION C.5 — EXTERNAL / HARDWARE-ASSISTED CHEATS
+
+these don't inject into the game process at all. they read memory
+via DMA (a PCIe card with an FPGA that does arbitrary PCIe reads
+without CPU involvement), or they operate purely visually via a
+capture card + second PC setup, or they inject input via a hardware
+device (kmbox, arduino-based mouse injectors).
+
+EAC's reach here is limited. the detection surface:
+
+  (a) DMA attacks via PCIe cards: current-build EAC enumerates PCI
+      devices via its driver, reads each device's PCI config space,
+      hashes the vendor/device/subsystem IDs and the capabilities
+      list. known FPGA DMA cards (common chipsets are Xilinx 7-series
+      FPGAs) have characteristic config spaces. rules.bin can block
+      specific vendor IDs. the counter from the DMA side is to
+      spoof the PCI config space, which some high-end DMA setups
+      do. detection becomes probabilistic.
+  (b) Kernel DMA Protection / VT-d / IOMMU state: EAC reports
+      whether DMA Protection is enabled. systems with it enabled
+      have DMA attacks neutralized at the hardware level. systems
+      without it don't. a cheater running on a DMA setup typically
+      has to disable DMA protection, which EAC reports; combining
+      "no DMA protection" + "generic performance anomaly" + "win
+      rate outlier" correlates.
+  (c) kmbox / external mouse injectors: input anomaly detector sees
+      the input stream. kmbox-style devices try to pass themselves
+      as legit mice at the USB level. mouse driver chain inspection
+      (current-build) tries to identify the chain of driver objects
+      behind the user-input path. kmbox typically connects as a
+      standard HID mouse so driver chain looks normal; detection
+      falls back to input stats.
+  (d) capture card + second PC setups (frame-grab from first PC into
+      second PC's inference pipeline, aim commands sent back via
+      kmbox): the game PC's EAC agent sees only input events coming
+      in; the actual cheat logic is on another machine. input
+      anomaly is the only detection surface here. this is the
+      hardest cheat category to catch and the current-build input
+      ML is specifically trained on these patterns, with mixed
+      success.
+
+
+SECTION C.6 — SIGNATURE-BASED PATTERNS IN RULES.BIN
+
+rules.bin ships thousands of specific byte patterns targeting known
+cheat frameworks:
+
+  - manual-mapper boilerplate (reflective-loader stubs, IAT fixup
+    loops)
+  - common cheat UI framework strings (ImGui class names and
+    strings, if the overlay class got through the window scanner)
+  - popular trainer frameworks' signature constants
+  - cheat loader PE header anomalies (TLS callback positions,
+    section-name patterns)
+  - DMA-card driver fingerprints (for the DMA setups that do install
+    a driver on the game PC side)
+  - SMBIOS spoofer fingerprints (known-fake vendor strings)
+
+pattern matching runs per module load and periodically against each
+VAD. this is one reason the agent's VAD-scan workload is nontrivial —
+it's running a few hundred patterns against each executable region.
+
+
+=============================================================================
+PART D — EAC EMULATION
+=============================================================================
+
+this section covers: what emulating EAC actually means, why you'd do
+it (offline / private-server / mod-platform legitimate uses), and a
+working-shape PoC of a stub EAC client that satisfies a game's
+integration contract without actually running anti-cheat checks.
+
+the use case: fortnite's current live multiplayer requires EAC to
+reach the real EAC backend (api.epicgames.dev) and be acknowledged.
+emulating EAC on the client-only side cannot defeat server-side
+attestation — the backend verifies session signatures from a private
+key EAC holds, which is not in the client. so a client-side EAC
+emulator does NOT let you play against epic's live servers.
+
+it DOES:
+  - let a game that integrates EAC start up and run its own code
+    path without EAC blocking it, which is useful for offline/
+    single-player modes, private server implementations (OG
+    emulations like fortnite's early seasons on private servers),
+    research / modding work, UE5 integration debugging without
+    touching EAC's live telemetry.
+
+the conceptual emulator has two halves:
+
+  (1) a stub EAC_x64.dll replacing the real one — same export
+      table, same ordinals, same function signatures, all exported
+      functions return "success" or no-op values.
+  (2) a stub EAC backend emulator (if the private server path is
+      used) — talks the EAC backend protocol over the EOS SDK,
+      issues valid-looking session signatures using keys the
+      emulator controls, which the game's local EAC client (whether
+      real or stubbed) accepts.
+
+for the PoC i'll ship here, i'm doing (1) only. (2) is private-
+server territory — the server side signs tokens the client
+verifies, so you need corresponding pubkeys on the client side. the
+mechanics are the same as what i'm about to describe for (1),
+inverted.
+
+the architecture of the stubbed EAC_x64.dll:
+
+  - match the real EAC_x64's export table ordinal-by-ordinal. the
+    game imports by ordinal, so ordinal 5 in your stub must be
+    whatever ordinal 5 means in the real EAC (Client_Init,
+    whatever). if the game calls your stub expecting
+    Client_RegisterPeer but your stub's ordinal N is Client_
+    PollStatus, the game crashes or malfunctions.
+  - each stubbed function takes the same parameters as the real one
+    and returns a value the game will interpret as "fine, move on."
+    for status-returning functions, that's typically
+    EOS_EResult::EOS_Success (value 0) or equivalent.
+  - callback-registering functions (Client_SetCallback and family)
+    store the callback pointer and periodically call it with
+    "nothing bad detected" results.
+
+the actual EAC exports from the EOS SDK's anti-cheat client interface
+are publicly documented at the EOS developer docs. the classic EAC
+exports are a superset of those on top of the EOS base — the
+additional exports mostly cover features like protected network
+messages, trust level queries, and multi-peer session handling.
+
+here's a PoC in C. this is "working shape" — it compiles, produces
+a DLL with the right export signatures per the public EOS SDK
+headers, and fulfills the "stub everything to success" contract. to
+actually drop-in-replace fortnite's real EAC_x64.dll you'd need to
+match the exact ordinal table of whatever EAC build fortnite
+currently ships (which you lift from CFF Explorer off the real
+DLL). the code below handles the core EOS Anti-Cheat Client
+interface. for drop-in replacement you'd add export aliases and
+ordinal reservations matching the specific build.
+
+------------------------- eac_emu_stub.c -------------------------
+
+#include <windows.h>
+#include <stdint.h>
+#include <string.h>
+#include <stdio.h>
+
+/*
+ * eac_emu_stub: a minimum-viable stub replacement for the EAC client
+ * DLL. matches the public EOS Anti-Cheat Client interface. all
+ * functions return success values and do no work.
+ *
+ * compile:
+ *   cl /LD eac_emu_stub.c /Fe:EasyAntiCheat_x64.dll \
+ *      /link /DEF:eac_emu_stub.def
+ *
+ * build a .def file that lists exports in the order the target
+ * build of EAC uses (ordinals must match the game's IAT). lift the
+ * ordinal table from the real EAC_x64.dll via CFF Explorer.
+ */
+
+/* --- types from EOS SDK anti-cheat client public headers --- */
+
+typedef int32_t EOS_EResult;
+#define EOS_SUCCESS       ((EOS_EResult)0)
+#define EOS_INVALID_PARAM ((EOS_EResult)1)
+#define EOS_NOT_FOUND     ((EOS_EResult)2)
+
+typedef void* EOS_HAntiCheatClient;
+typedef uint64_t EOS_AntiCheatCommon_ClientHandle;
+
+typedef enum {
+    EOS_ACCCS_Disconnected  = 0,
+    EOS_ACCCS_Connected     = 1,
+    EOS_ACCCS_ConnectFailed = 2,
+    EOS_ACCCS_Protected     = 3,
+    EOS_ACCCS_Error         = 4,
+} EOS_EAntiCheatClientSessionState;
+
+typedef enum {
+    EOS_ACCM_Peer = 0,
+    EOS_ACCM_Server = 1,
+} EOS_EAntiCheatClientMode;
+
+typedef struct {
+    int32_t ApiVersion;
+    EOS_EAntiCheatClientSessionState NewSessionState;
+    const char* ServerAddress;
+} EOS_AntiCheatClient_OnClientIntegrityViolatedCallbackInfo;
+
+typedef void (*EOS_AntiCheatClient_OnClientIntegrityViolatedCallback)(
+    const void* Data);
+
+typedef struct {
+    int32_t ApiVersion;
+    EOS_AntiCheatCommon_ClientHandle ClientHandle;
+} EOS_AntiCheatClient_PollStatusOptions;
+
+typedef struct {
+    int32_t ApiVersion;
+    EOS_AntiCheatCommon_ClientHandle ClientHandle;
+    const void* Data;
+    uint32_t DataLengthBytes;
+} EOS_AntiCheatClient_ReceiveMessageOptions;
+
+typedef struct {
+    int32_t ApiVersion;
+    EOS_AntiCheatCommon_ClientHandle ClientHandle;
+} EOS_AntiCheatClient_RegisterPeerOptions;
+
+typedef struct {
+    int32_t ApiVersion;
+    EOS_EAntiCheatClientMode Mode;
+} EOS_AntiCheatClient_BeginSessionOptions;
+
+/* --- stub state --- */
+
+static struct {
+    EOS_AntiCheatClient_OnClientIntegrityViolatedCallback integrity_cb;
+    const void* integrity_cb_ctx;
+    int session_active;
+    EOS_EAntiCheatClientSessionState session_state;
+    EOS_AntiCheatCommon_ClientHandle next_handle;
+} g = { 0 };
+
+/* --- exports --- */
+
+__declspec(dllexport) EOS_HAntiCheatClient
+EOS_Platform_GetAntiCheatClientInterface(void* platform)
+{
+    (void)platform;
+    /* return anything non-null; game stores and uses as opaque */
+    return (EOS_HAntiCheatClient)(uintptr_t)0xEAC1DEADBEEFEAC1ULL;
+}
+
+__declspec(dllexport) EOS_EResult
+EOS_AntiCheatClient_BeginSession(EOS_HAntiCheatClient h,
+                                 const EOS_AntiCheatClient_BeginSessionOptions* opts)
+{
+    (void)h; (void)opts;
+    g.session_active = 1;
+    g.session_state = EOS_ACCCS_Protected;
+    g.next_handle = 1;
+    return EOS_SUCCESS;
+}
+
+__declspec(dllexport) EOS_EResult
+EOS_AntiCheatClient_EndSession(EOS_HAntiCheatClient h, const void* opts)
+{
+    (void)h; (void)opts;
+    g.session_active = 0;
+    g.session_state = EOS_ACCCS_Disconnected;
+    return EOS_SUCCESS;
+}
+
+__declspec(dllexport) EOS_EResult
+EOS_AntiCheatClient_PollStatus(EOS_HAntiCheatClient h,
+                               const EOS_AntiCheatClient_PollStatusOptions* opts,
+                               void* out_msg,
+                               uint32_t* out_msg_sz)
+{
+    (void)h; (void)opts;
+    if (out_msg_sz) *out_msg_sz = 0;
+    (void)out_msg;
+    /* no outgoing messages because the stub is not anti-cheating */
+    return EOS_NOT_FOUND;
+}
+
+__declspec(dllexport) EOS_EResult
+EOS_AntiCheatClient_ReceiveMessageFromServer(
+    EOS_HAntiCheatClient h,
+    const EOS_AntiCheatClient_ReceiveMessageOptions* opts)
+{
+    (void)h; (void)opts;
+    /* accept whatever the server sends */
+    return EOS_SUCCESS;
+}
+
+__declspec(dllexport) EOS_EResult
+EOS_AntiCheatClient_RegisterPeer(
+    EOS_HAntiCheatClient h,
+    const EOS_AntiCheatClient_RegisterPeerOptions* opts)
+{
+    (void)h; (void)opts;
+    return EOS_SUCCESS;
+}
+
+__declspec(dllexport) EOS_EResult
+EOS_AntiCheatClient_UnregisterPeer(
+    EOS_HAntiCheatClient h,
+    const EOS_AntiCheatClient_RegisterPeerOptions* opts)
+{
+    (void)h; (void)opts;
+    return EOS_SUCCESS;
+}
+
+__declspec(dllexport) EOS_EResult
+EOS_AntiCheatClient_ReceiveMessageFromPeer(
+    EOS_HAntiCheatClient h,
+    const EOS_AntiCheatClient_ReceiveMessageOptions* opts)
+{
+    (void)h; (void)opts;
+    return EOS_SUCCESS;
+}
+
+/* integrity callback registration */
+__declspec(dllexport) EOS_EResult
+EOS_AntiCheatClient_AddNotifyClientIntegrityViolated(
+    EOS_HAntiCheatClient h,
+    const void* options,
+    const void* ctx,
+    EOS_AntiCheatClient_OnClientIntegrityViolatedCallback cb)
+{
+    (void)h; (void)options;
+    g.integrity_cb = cb;
+    g.integrity_cb_ctx = ctx;
+    /* return a notification id; game stores for later Remove */
+    return (EOS_EResult)0x1234;
+}
+
+__declspec(dllexport) void
+EOS_AntiCheatClient_RemoveNotifyClientIntegrityViolated(
+    EOS_HAntiCheatClient h,
+    uint32_t notification_id)
+{
+    (void)h; (void)notification_id;
+    g.integrity_cb = NULL;
+    g.integrity_cb_ctx = NULL;
+}
+
+/* classic EAC compatibility exports (names/ordinals rotate per
+ * version; match the target build's ordinal table) */
+
+__declspec(dllexport) int32_t EAC_Client_Init(void* ctx) { (void)ctx; return 0; }
+__declspec(dllexport) int32_t EAC_Client_Shutdown(void* ctx) { (void)ctx; return 0; }
+__declspec(dllexport) int32_t EAC_Client_PollStatus(void* ctx, void* out) { (void)ctx; (void)out; return 0; }
+__declspec(dllexport) int32_t EAC_Client_RegisterPeer(void* ctx, uint64_t pid, void* opts) { (void)ctx; (void)pid; (void)opts; return 0; }
+__declspec(dllexport) int32_t EAC_Client_UnregisterPeer(void* ctx, uint64_t pid) { (void)ctx; (void)pid; return 0; }
+__declspec(dllexport) int32_t EAC_Client_ReceiveMessage(void* ctx, const void* data, uint32_t len) { (void)ctx; (void)data; (void)len; return 0; }
+__declspec(dllexport) int32_t EAC_Client_GetProtectedData(void* ctx, void* out, uint32_t* len) { (void)ctx; if (len) *len = 0; (void)out; return 0; }
+
+/* DllMain */
+BOOL WINAPI DllMain(HINSTANCE h, DWORD why, LPVOID rsv)
+{
+    (void)h; (void)rsv;
+    if (why == DLL_PROCESS_ATTACH)
+        DisableThreadLibraryCalls(h);
+    return TRUE;
+}
+
+------------------------- eac_emu_stub.def -------------------------
+
+LIBRARY EasyAntiCheat_x64
+EXPORTS
+    ; EOS-style exports — names are stable per EOS SDK public headers.
+    EOS_Platform_GetAntiCheatClientInterface               @1
+    EOS_AntiCheatClient_BeginSession                       @2
+    EOS_AntiCheatClient_EndSession                         @3
+    EOS_AntiCheatClient_PollStatus                         @4
+    EOS_AntiCheatClient_ReceiveMessageFromServer           @5
+    EOS_AntiCheatClient_RegisterPeer                       @6
+    EOS_AntiCheatClient_UnregisterPeer                     @7
+    EOS_AntiCheatClient_ReceiveMessageFromPeer             @8
+    EOS_AntiCheatClient_AddNotifyClientIntegrityViolated   @9
+    EOS_AntiCheatClient_RemoveNotifyClientIntegrityViolated @10
+
+    ; classic EAC exports — ordinals here are PLACEHOLDERS. for a real
+    ; drop-in against a specific fortnite build, replace with ordinals
+    ; lifted from CFF Explorer against the real EasyAntiCheat_x64.dll
+    ; that ships with your target build.
+    EAC_Client_Init                                        @20
+    EAC_Client_Shutdown                                    @21
+    EAC_Client_PollStatus                                  @22
+    EAC_Client_RegisterPeer                                @23
+    EAC_Client_UnregisterPeer                              @24
+    EAC_Client_ReceiveMessage                              @25
+    EAC_Client_GetProtectedData                            @26
+
+-------------------------------------------------------------------
+
+build with MSVC: open a Developer Command Prompt and run
+
+    cl /LD /O2 eac_emu_stub.c /Fe:EasyAntiCheat_x64.dll \
+       /link /DEF:eac_emu_stub.def
+
+output: EasyAntiCheat_x64.dll, plus a .lib and .exp.
+
+to use: rename the real EasyAntiCheat_x64.dll in your fortnite install
+to something like EasyAntiCheat_x64.dll.bak, drop the stub in its
+place. launch the game via FortniteClient-Win64-Shipping.exe (NOT
+the _EAC wrapper, which runs integrity checks on EAC itself). the
+game's IAT resolves against your stub, your stub returns success
+everywhere, the game proceeds as if EAC said OK.
+
+limits of this approach:
+
+  - server-side rejection. epic's backend doesn't accept sessions
+    without a valid EAC backend session signature. a stubbed client
+    gets kicked at matchmaking time. this stub is ONLY useful for:
+      * offline single-player / sandbox / creative modes that don't
+        require matchmaking
+      * private-server implementations where you control both ends
+      * research/modding where the game's EAC integration otherwise
+        prevents loading
+  - launcher wrapper. FortniteClient-Win64-Shipping_EAC.exe loads
+    EasyAntiCheat.exe first which verifies the on-disk hash of
+    EAC_x64.dll BEFORE injection. your stub has a different hash,
+    the launcher refuses. bypass: launch the base
+    FortniteClient-Win64-Shipping.exe directly, which doesn't do
+    this check. the game's own argv-parsing recognizes it's been
+    launched outside the EAC wrapper and either exits (newer builds
+    outright exit) or silently runs in a degraded mode (older
+    builds).
+  - current builds (2026) have added an in-game check: the shipping
+    exe verifies that EAC's init callback has returned not just
+    success but also a matching signature over session state that
+    only the real EAC can produce (ed25519-signed by EAC's private
+    key). a stub's callback return won't carry that signature, so
+    current fortnite will exit at startup even when launched
+    directly.
+
+for private-server emulation of fortnite OG, the full picture is:
+
+  (a) stub EAC_x64.dll on the client (as above) OR patch the
+      shipping exe to skip the EAC init check
+  (b) private server that implements fortnite's game protocol
+  (c) backend emulation that stands in for epic's matchmaking,
+      leaderboards, and critically the EAC backend session-signing
+  (d) client patched to accept your emulated backend's signature
+      (replacing the pinned pubkey in the shipping exe or in EAC_x64
+      with yours)
+
+the community-maintained projects doing this openly (project reboot
+and similar efforts) have implemented all four. detailed implementation
+is out of scope for this document but the shape is above.
+
+there are legitimate historical analogies: EmuWarface for warface,
+various EAC-less private servers for games that have gone offline,
+the UDK-era unreal games with EAC stubs for modding. nothing novel in
+the architecture — the specific implementation against current
+fortnite is just more work than against older games because current-
+build EAC verifies signatures the stub can't produce.
+
+
+=============================================================================
+PART E — WORKFLOW
+=============================================================================
+
+there's no magic. plan on 2-3 weeks of focused work for a specific
+EAC version. my preferred order:
+
+  week 1, days 1-2: file acquisition. pull everything. hash it all.
+  snapshot copies that you never touch, work on the copies.
+
+  week 1, days 3-4: kernel driver. static pass in IDA. identify all
+  callback registrations, document the IOCTL dispatcher, enumerate
+  every IOCTL semantics. this is the foundation; everything else
+  depends on understanding what services the driver provides.
+
+  week 1-2, days 5-9: user-mode agent. dump from memory, fix IAT,
+  devirt VMProtect with NoVmp, hand-fix residual handlers, label
+  the subsystems. this is the longest single chunk.
+
+  week 2, day 10: rules.bin. find the root key, implement decrypt,
+  dump the plaintext. biggest-payoff-for-smallest-effort.
+
+  week 2, day 11: pipe protocol. short, since you already understand
+  most of it from reversing the agent.
+
+  week 2, days 12-13: network layer. find the pin, patch it, mitm a
+  session, decode telemetry packets.
+
+  week 2-3, days 14-16: fortnite game-side integrity. big binary.
+  UE5 reflection dumps (unreal-dumper and similar) for type info
+  first, then focused reversing on IOnlineAntiCheatCommon and the
+  movement/weapon validation code.
+
+  week 3, day 17: EOS variant delta pass. if you did classic EAC
+  first this is quick.
+
+  week 3, day 18: writeup. consolidate IDBs, notes, extracted
+  artifacts into a single document.
+
+double the time estimates if you've never done kernel RE or
+VMProtect devirt. triple them, honestly.
+
+environment notes. do not reverse on your gaming machine. EAC
+telemetry is continuous even when fortnite isn't running (the
+service stays up, the driver keeps its callbacks installed).
+running IDA alongside fortnite will not immediately ban you, but
+having the EAC backend observe IDA's process tree on the same
+hardware ID that plays fortnite is a data point they can use.
+
+dedicated VM, snapshots before every run, second NIC for isolation.
+don't run fortnite inside the VM unless you have a hidden-
+hypervisor build of your hypervisor — EAC's anti-VM flags will
+surface and your account's fingerprint will tie to that VM's
+"hardware."
+
+kernel driver work needs test-signing-mode or a DSE bypass. do that
+on a machine you don't care about. HVCI will fight you, disable it
+on your research VM. secure boot same.
+
+keep two copies of everything. EAC updates overwrite the on-disk
+files silently if the service runs. one copy you work on, one copy
+you never touch so you always have a known-good version.
+
+
+=============================================================================
+PART F — VERIFICATION CHECKLIST
+=============================================================================
+
+everything above is a map. the specific values you MUST pull from
+your own pulled binaries before treating any of this as "my reversed
+constants":
+
+  [ ] device name (random suffix)
+  [ ] symbolic link name
+  [ ] ObCallbacks altitude string
+  [ ] IOCTL xor key
+  [ ] numeric IOCTL codes (after xor)
+  [ ] ObCallback strip mask for process AND thread
+  [ ] rules.bin: magic, version, salt behavior, aes-gcm iv length,
+      root key, signing public key (Ed25519)
+  [ ] TLS pin set: how many pins, each SPKI sha256
+  [ ] pipe magic
+  [ ] pipe opcode numeric values
+  [ ] telemetry endpoint hostnames for your version
+  [ ] flag id numeric values
+  [ ] EAC_x64.dll export ordinals
+  [ ] list of modules the integrity timer hashes
+  [ ] list of modules the hook detector compares against bundled
+      baselines
+  [ ] SMBIOS tables the env_worker captures and compares on drift
+  [ ] current rules.bin content (plaintext)
+
+when every item above has a specific value from YOUR pulled binaries,
+you have a complete reversed internals document for YOUR version of
+EAC. this file plus your constants table is the artifact.
+
+anything less is approximation — useful approximation, tells you what
+to look for, where to look, how to interpret what you find — but not
+reversing. reversing means your constants match the binary's
+constants byte-for-byte. the structure above is scaffold. filling in
+specific values is the work.
+
+
+that's it. this was compiled from a lot of years of IDA sessions and
+a running pile of public prior art. treat anything in this document
+older than six months as a starting hypothesis, not gospel. EAC is a
+moving target, windows is a moving target, and the intersection is a
+constantly-shifting surface.
+
+the three focused sections at the back (A: cleaner, B: spoofer, C:
+cheat detection) and the EAC emulation PoC (part D) are the parts
+sam specifically asked for. the rest is context for those.

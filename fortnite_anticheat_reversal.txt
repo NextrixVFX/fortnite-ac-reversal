@@ -1,0 +1,757 @@
+================================================================================
+FORTNITE ANTI-CHEAT — COMPLETE REVERSAL RESEARCH DOCUMENT
+================================================================================
+Target scope: Every anti-cheat and anti-tamper component shipped with Fortnite
+on Windows (PC). Recon, download locations, structural map, known internals,
+reversal workflow, tooling, and per-component reverse engineering plan.
+
+Date compiled: 2026-11-15
+Platform focus: Windows x64 (primary target). macOS/consoles noted where
+relevant.
+
+================================================================================
+SECTION 0 — EXECUTIVE SUMMARY: WHAT FORTNITE ACTUALLY RUNS
+================================================================================
+
+Fortnite's anti-cheat stack is NOT a single product. It is a layered pipeline.
+Reversing "Fortnite anti-cheat" means reversing all of these:
+
+  1. Easy Anti-Cheat (EAC)                 — Epic-owned since Oct 2018. Both
+                                              user-mode and kernel-mode
+                                              components. Primary runtime AC.
+  2. Easy Anti-Cheat for Epic Online       — Newer EOS-integrated variant that
+     Services (EAC-EOS / EAC "new")          runs alongside / is replacing the
+                                              classic EAC service model.
+  3. BattlEye (HISTORICAL)                 — Was shipped with Fortnite in
+                                              parallel with EAC in early years.
+                                              Dropped by Epic around 2021-2022
+                                              in favor of EAC consolidation.
+                                              Leave this in scope if you're
+                                              reversing older Fortnite builds.
+  4. Epic's proprietary integrity layer    — In-game checks inside the Fortnite
+     (sometimes called "EAC-internal"        binary itself: integrity scans of
+     or Epic's "hyperdrive"                  the game image, UE4/UE5 VM hooks,
+     telemetry — note: not Microsoft's       custom syscalls through EAC's
+     Hyperion)                               driver, and server-side heuristics
+                                              (movement, aim snap, fire-rate
+                                              anomalies).
+  5. Code signing / driver load policy     — Fortnite refuses to launch when
+                                              Windows Test Signing is on,
+                                              when known cheat drivers are
+                                              present, or when HVCI/Secure
+                                              Boot state looks tampered.
+  6. Server-side ML heuristics             — Opaque to client reversal, but
+                                              worth documenting your bans
+                                              against: trajectory / recoil /
+                                              headshot ratio models run in
+                                              Epic's backend.
+
+Everything below is public-knowledge reversal work. Secret Club, Mellow, and
+dozens of researchers have published teardowns; most of this document is
+consolidated prior art, not new vulnerability disclosure. Treat it as the map
+you need before you open IDA.
+
+================================================================================
+SECTION 1 — FILES YOU MUST PULL BEFORE REVERSING
+================================================================================
+
+All paths assume a default Epic Games Launcher install. Substitute your own
+install root if different.
+
+INSTALL ROOT (typical):
+  C:\Program Files\Epic Games\Fortnite\
+
+----------------------------------------------------------------------
+1.1  EAC CLASSIC SERVICE FILES (per-game, bundled with Fortnite)
+----------------------------------------------------------------------
+Path:
+  <FORTNITE>\FortniteGame\Binaries\Win64\EasyAntiCheat\
+
+Files (filenames stable, versions change):
+  EasyAntiCheat.exe                — Launcher stub. Spawns EAC service, opens
+                                      a named pipe to the game, performs
+                                      initial environment checks.
+  EasyAntiCheat_launcher.exe       — Alternate launcher used by newer builds.
+  EasyAntiCheat_x64.dll            — User-mode agent injected into the game.
+                                      The big target. Contains most heuristics,
+                                      scan routines, string tables, VMProtect-
+                                      packed sections.
+  EasyAntiCheat.sys                — Kernel driver. Signed by Easy Anti-Cheat
+                                      Oy / Epic Games. Loaded on service
+                                      start. Targets: process callbacks,
+                                      handle stripping, module enumeration,
+                                      memory scans, syscall hooks.
+  Settings.json                    — Per-title config: which anti-tamper
+                                      levels are enabled, which diagnostics
+                                      send, module whitelists.
+  pbrules.bin / rules.bin          — Encrypted ruleset blob (format varies).
+                                      Decrypted at runtime by EAC_x64.dll.
+                                      Contains banned module names, banned
+                                      process names, known-bad window class
+                                      strings, YARA-like byte patterns.
+  Certificate.pem / cert.dat       — Trust anchor for talking to EAC's
+                                      backend. Pinned.
+  easyanticheat_<locale>.txt       — Localized error strings. Useful cross-
+                                      reference when mapping error codes
+                                      back to scan routines.
+
+----------------------------------------------------------------------
+1.2  EAC SYSTEM-WIDE INSTALL
+----------------------------------------------------------------------
+Path:
+  C:\Program Files (x86)\EasyAntiCheat\
+  C:\Program Files (x86)\Common Files\EasyAntiCheat\
+
+Same files as above, plus:
+  EasyAntiCheat_Setup.exe          — Installer. Registers the service,
+                                      drops the driver, sets up the
+                                      scheduled task.
+  <service registry key>           — HKLM\SYSTEM\CurrentControlSet\Services\
+                                       EasyAntiCheat
+                                       — ImagePath, Start type, FailureAction
+
+----------------------------------------------------------------------
+1.3  EAC-EOS (NEW EAC)
+----------------------------------------------------------------------
+Path:
+  <FORTNITE>\FortniteGame\Binaries\Win64\EasyAntiCheat_EOS\
+
+Files:
+  EasyAntiCheat_EOS.exe
+  EasyAntiCheat_EOS_x64.dll
+  EasyAntiCheat_EOS.sys
+  Certificates\ (folder with pinned certs)
+  SplashScreen.png                 — Not reversable but helps identify
+                                      which EAC build you have.
+
+The EOS variant differs structurally from classic EAC:
+  - Shifts more work to user-mode.
+  - Uses EOS SDK transport (TLS to api.epicgames.dev).
+  - Driver is smaller; many checks moved into the DLL behind VMProtect.
+
+----------------------------------------------------------------------
+1.4  THE GAME BINARY ITSELF
+----------------------------------------------------------------------
+Path:
+  <FORTNITE>\FortniteGame\Binaries\Win64\
+
+Primary targets:
+  FortniteClient-Win64-Shipping.exe         — Main game. Hosts UE5. Contains
+                                               integrity hooks that call back
+                                               into EAC_x64.dll.
+  FortniteClient-Win64-Shipping_EAC.exe     — EAC-protected launcher wrapper.
+                                               This is what actually launches
+                                               when EAC is active.
+  FortniteClient-Win64-Shipping_EAC_EOS.exe — EOS variant wrapper.
+  FortniteLauncher.exe                      — Pre-launcher. Checks EAC
+                                               service state, spawns the
+                                               real client.
+
+The Shipping EXE is ~200+ MB and huge, but critical: the anti-cheat/game
+boundary (RPCs, server-authoritative checks, telemetry packets) lives here.
+
+----------------------------------------------------------------------
+1.5  DRIVER CERTIFICATES & SIGNING METADATA
+----------------------------------------------------------------------
+Pull with signtool or PE inspection:
+  signtool verify /pa /v EasyAntiCheat.sys
+
+Issuer chain of interest:
+  "Easy Anti-Cheat Oy"             — legacy signer
+  "Epic Games Inc"                 — newer signer
+  cross-signed via Microsoft WHQL
+
+Save the certificate chains to disk during pull; they're useful for:
+  - timeline analysis (version -> signed date)
+  - identifying leaked / revoked variants
+  - understanding what revocation state blocks loading
+
+----------------------------------------------------------------------
+1.6  TELEMETRY ENDPOINTS (CAPTURE DURING RUNTIME)
+----------------------------------------------------------------------
+Grab these with Wireshark + SSLKEYLOGFILE while launching Fortnite:
+  modules-cdn.eac-prod.on.epicgames.com    — module blob CDN (binary
+                                              rules + remote checker DLLs)
+  download.eac-prod.on.epicgames.com       — update channel
+  api.easy.ac / service.easyanticheat.net  — legacy classic endpoints
+  api.epicgames.dev                        — EOS endpoint for EOS variant
+
+Snapshot every HTTP body — EAC downloads auxiliary modules at runtime, and
+if you don't capture them, your static analysis is missing code.
+
+----------------------------------------------------------------------
+1.7  HISTORICAL — BATTLEYE FILES (IF REVERSING OLD BUILDS)
+----------------------------------------------------------------------
+Path (old Fortnite installs only):
+  <FORTNITE>\FortniteGame\Binaries\Win64\BattlEye\
+
+Files:
+  BEService.exe                    — service
+  BEClient.dll / BEClient_x64.dll  — user-mode client
+  BEDaisy.sys                      — kernel driver
+  BEServer.dll                     — server stub
+  Config / Logs folders
+
+Not shipped in current Fortnite but needed if auditing historical ban waves.
+
+================================================================================
+SECTION 2 — OBTAINING THE FILES CLEANLY
+================================================================================
+
+Three reliable pull methods. Pick based on your trust model.
+
+----------------------------------------------------------------------
+2.1  FROM A LIVE INSTALL (easiest)
+----------------------------------------------------------------------
+  Steps:
+    1. Install Fortnite via Epic Games Launcher.
+    2. Let it do a FIRST-LAUNCH verify (this triggers EAC's install).
+    3. Copy EVERY file listed in Section 1 to an air-gapped VM before
+       you touch them. EAC's service will overwrite / self-update.
+    4. Kill the EAC service before copying so you don't get partial
+       reads:
+         sc stop EasyAntiCheat
+    5. Hash everything you pull (sha256) and log version strings:
+         sigcheck -a -h EasyAntiCheat_x64.dll
+
+----------------------------------------------------------------------
+2.2  FROM EPIC'S CDN DIRECTLY
+----------------------------------------------------------------------
+Fortnite's manifest (Epic Launcher API) exposes direct download URLs for
+every bundled file. Capture a manifest fetch with Fiddler or burp:
+
+  POST https://launcher-public-service-prod06.ol.epicgames.com/launcher/api/public/assets/...
+
+Parse the ChunkList, resolve ChunkUris, concatenate chunks per file. This
+is how third-party installers (Legendary, rare-loader) work. For AC files:
+
+  Open-source tool: `legendary` (on GitHub) — `legendary install Fortnite`
+  then pull the AC subtree only via --prefix flag.
+
+----------------------------------------------------------------------
+2.3  FROM EAC MODULE CDN (runtime fetches)
+----------------------------------------------------------------------
+Dynamic modules are downloaded by EAC at runtime. They're not in the
+installer. Capture them with:
+  - Fiddler / mitmproxy with a locally-trusted CA (won't work against
+    EAC's pinned cert — you need to patch the pin at the DLL level, see
+    Section 5.4)
+  - OR: dump them from memory AFTER EAC loads them, using a kernel memory
+    scanner (requires DSE off / test-signing VM)
+
+================================================================================
+SECTION 3 — TOOLING (what you need installed before the reversal starts)
+================================================================================
+
+DISASSEMBLER / DECOMPILER:
+  - IDA Pro 8.x+ (with Hex-Rays x64 decompiler)  — gold standard
+  - Ghidra 11+                                    — free alternative,
+                                                    weaker on VMProtect
+  - Binary Ninja 4.x                              — strong HLIL
+
+UNPACKERS / DEOBFUSCATORS:
+  - VMProtect unpacker scripts (xjunior's,
+    JustMagic, VTIL)
+  - Themida unpackers (less likely — EAC is VMP)
+  - x64dbg + Scylla                               — IAT reconstruction
+  - UnpacMe (online)                              — convenience
+  - NoVmp (GitHub, can_1357) + VTIL-Core           — VMProtect devirt
+  - Unicorn Engine                                — emulation helper
+
+DEBUGGERS:
+  - x64dbg                                        — user-mode
+  - WinDbg (preview)                              — kernel
+  - KD + VirtualKD or network-kernel debugging    — pair host+guest VM
+  - HyperDbg (hypervisor-based)                   — bypasses EAC's
+                                                    anti-debug cleanly
+
+MEMORY & PROCESS TOOLS:
+  - Process Hacker 2 / System Informer
+  - Process Monitor (procmon)
+  - ETW (Event Tracing for Windows) — WPA
+  - PE-bear / CFF Explorer                        — PE inspection
+
+NETWORK:
+  - Wireshark + SSLKEYLOGFILE patch of chrome/firefox
+  - mitmproxy
+  - Fiddler Everywhere
+
+KERNEL / DRIVER:
+  - DriverView (Nirsoft)
+  - PE-sieve
+  - DSEFix / KDMapper (ONLY on test systems, used to load an unsigned
+    inspector driver for scanning EAC's driver — DO NOT point these at
+    production game sessions)
+
+REBUILD / NOTE-TAKING:
+  - Obsidian / plain Markdown
+  - revtool or Hex-Rays Lumen (collaborative DB)
+
+Environment:
+  - A Windows 10/11 VM with:
+      * Hyper-V or VMware (Hyper-V disables HVCI nicely for driver work)
+      * Snapshots BEFORE every EAC launch
+      * Separate VM for live-run captures, separate VM for static analysis
+  - Linux host for scripting (IDA Python, radare2, binwalk on dumps)
+
+================================================================================
+SECTION 4 — PROTECTION STACK YOU WILL ENCOUNTER
+================================================================================
+
+EAC's binaries are not plain PEs. Expect:
+
+4.1  VMProtect 3.x
+     - Primary obfuscator on EasyAntiCheat_x64.dll and EasyAntiCheat.sys.
+     - Custom handlers; EAC uses ultra-mutation + import protection.
+     - Devirtualization: NoVmp works on most handlers; residual branches
+       must be hand-lifted.
+
+4.2  Custom VM layer (above VMProtect in newer builds)
+     - EAC wraps a thin interpreter around sensitive checks (e.g. module
+       scan loop). Opcodes are rotated per version.
+     - Rebuild technique: trace in Unicorn, extract opcode table,
+     - cross-reference with constants in the .data section.
+
+4.3  Control-flow flattening
+     - Dispatcher-state machine. Visible as a giant switch on a state
+       variable. Use DeFlat (GitHub: dnpushme) or Triton to unflatten.
+
+4.4  Anti-debug
+     - NtQueryInformationProcess(ProcessDebugPort / ProcessDebugFlags)
+     - NtSetInformationThread(ThreadHideFromDebugger)
+     - PEB->BeingDebugged, NtGlobalFlag, Heap flags
+     - HWBP detection via GetThreadContext Dr0-Dr3
+     - Timing: rdtsc / QueryPerformanceCounter deltas
+     - Window class enumeration for "OLLYDBG", "ida", "x64dbg", "WinDbg"
+     - Parent process check (must be FortniteLauncher.exe or Epic
+       Launcher)
+     - Kernel-side: ObRegisterCallbacks on process/thread handle open —
+       strips PROCESS_VM_READ/WRITE/ALL_ACCESS from handles to the game
+       and to itself.
+
+4.5  Anti-VM
+     - CPUID leaf 0x40000000 hypervisor brand check
+     - Registry: HKLM\SOFTWARE\VMware, Oracle, etc.
+     - Device enumeration: \\.\VBoxMiniRdrDN, \\.\pipe\VBoxTrayIPC
+     - MAC prefixes (00:05:69, 00:0C:29, 08:00:27)
+     - Mitigation: patch hypervisor-brand, spoof MAC, remove VBox/VMware
+       services, use hidden-hypervisor builds of VMware.
+
+4.6  Anti-tamper (self-integrity)
+     - CRC32 / SHA256 of own .text pages, verified on a timer thread.
+     - IAT verification (checks resolved addresses against expected
+       modules).
+     - Mitigation for research: run checks in a separate address space
+       (DLL-in-sidecar pattern) and proxy results.
+
+4.7  Signature / whitelist checks
+     - System32 driver whitelist: loaded drivers must have Microsoft
+       signatures or appear in EAC's whitelist blob.
+     - Any unsigned or test-signed driver → immediate ban-flag.
+
+================================================================================
+SECTION 5 — PER-COMPONENT REVERSAL PLAN
+================================================================================
+
+This is the actual work. One pass per component. Do them in this order
+because each depends on the previous.
+
+----------------------------------------------------------------------
+5.1  EasyAntiCheat.exe (user-mode launcher)
+----------------------------------------------------------------------
+Goal: Understand startup flow. Which registry keys, which named pipes,
+how it hands off to the DLL.
+
+Steps:
+  1. Load into IDA. Lightly packed. Identify entry (usually wWinMain).
+  2. Trace: service manager calls (OpenSCManager, StartService) ->
+     CreateNamedPipeA ("\\\\.\\pipe\\EasyAntiCheat...") -> fork game
+     process with injected EAC_x64.dll via LoadLibrary stub.
+  3. Document the pipe protocol. It uses a simple framed format:
+       [u32 opcode][u32 length][payload]
+     Early opcodes: HELLO, CAPS, SETTINGS_REQ, SCAN_RESULT.
+  4. Note any command-line args passed to the game — these carry EAC
+     session tokens needed for the game to talk to EAC.
+
+Output artifact: pipe-protocol.md with every opcode enumerated.
+
+----------------------------------------------------------------------
+5.2  EasyAntiCheat.sys (kernel driver) — THE HARD PART
+----------------------------------------------------------------------
+Goal: Enumerate every callback, hook, and syscall this driver sets up.
+
+Steps:
+  1. Pull the .sys. Verify signature and WHQL cross-sign.
+  2. PE inspection: imports (ntoskrnl.exe primarily), exports (usually
+     DriverEntry only), sections (.text / .pdata / vmp0 / vmp1).
+  3. Open in IDA with the correct LoadLibrary-style kernel signatures.
+     Import ntoskrnl TIL / PDB from your matching Windows build.
+  4. Locate DriverEntry.
+     Expected setup calls, in rough order:
+       a) IoCreateDevice("\\Device\\EasyAntiCheat")
+       b) IoCreateSymbolicLink("\\DosDevices\\EasyAntiCheat")
+       c) PsSetCreateProcessNotifyRoutineEx — hook process creation,
+          watch for cheat-process names, map game PID.
+       d) PsSetCreateThreadNotifyRoutine     — track thread creation
+          into game process (injected thread detection).
+       e) PsSetLoadImageNotifyRoutine        — scan every DLL loaded
+          into any process; flag known cheat modules (rules.bin).
+       f) ObRegisterCallbacks on PsProcessType and PsThreadType —
+          this is the handle-stripping hook. When any process opens
+          the game process, EAC's pre-op callback strips
+          PROCESS_VM_READ, PROCESS_VM_WRITE, PROCESS_VM_OPERATION,
+          PROCESS_CREATE_THREAD from the DesiredAccess mask.
+       g) CmRegisterCallback (optional) — watch registry for
+          anti-cheat tamper.
+       h) MmGetSystemRoutineAddress("NtReadVirtualMemory") and
+          friends — some builds inline-hook syscall entrypoints via
+          SSDT shadow or inline trampolines (rare on modern Windows
+          with PatchGuard; EAC usually stays legal here).
+  5. Enumerate IOCTL table in the dispatch routine. IOCTL codes are
+     obfuscated (XOR'd at compile time, decrypted at init). Trace the
+     dispatcher to recover them.
+     Common IOCTLs (names reconstructed from behavior):
+       IOCTL_EAC_READ_MEM        — proxied kernel-mode read of a
+                                   physical address range (used to
+                                   scan game memory bypassing user
+                                   hooks)
+       IOCTL_EAC_ENUM_HANDLES    — enumerate handles to the game
+                                   process from other processes
+       IOCTL_EAC_ENUM_THREADS    — list all threads in a process
+       IOCTL_EAC_GET_MODULES     — walk VAD tree for loaded modules
+                                   (not just LDR — catches
+                                   manually-mapped DLLs)
+       IOCTL_EAC_SCAN_PATTERN    — YARA-ish byte scan
+       IOCTL_EAC_PROCESS_INFO    — PEB/TEB read without touching
+                                   user mode
+  6. Document the VAD scan. This is how manual-map cheats get caught:
+     the driver walks the game's VAD tree directly; a module not in
+     LDR but present in VAD = suspicious mapped region.
+  7. Document the physical-memory read path — if present, it uses
+     MmMapIoSpace or MmGetPhysicalAddress to bypass any user-level
+     patch of ZwReadVirtualMemory.
+
+Output artifact: eac_sys_hooks.md listing every callback, every IOCTL
+with input/output structs, every kernel import used.
+
+----------------------------------------------------------------------
+5.3  EasyAntiCheat_x64.dll (user-mode agent inside the game)
+----------------------------------------------------------------------
+Goal: The big one. Contains all the heuristics.
+
+Steps:
+  1. Dump from memory, not disk. The on-disk DLL is packed; the dumped
+     image has the unpacked VMProtect stub resolved. Use Scylla to
+     dump and fix the IAT.
+  2. Devirtualize VMProtect regions with NoVmp. Save the devirtualized
+     IDB.
+  3. Enumerate functional groupings (expect these):
+       - Pipe client (talks to EasyAntiCheat.exe)
+       - Driver client (DeviceIoControl calls to \\.\EasyAntiCheat)
+       - Module enumeration (LDR walk + VAD request via driver)
+       - Window enumeration (EnumWindows, FindWindowW looking for
+         overlay class names: "DirectX11Overlay", "CheatEngine",
+         etc.)
+       - Thread enumeration (NtQuerySystemInformation
+         SystemProcessInformation)
+       - Hook detection (compare .text pages of ntdll/kernel32 against
+         clean copies fetched from \KnownDlls)
+       - Screenshot capture (DXGI OutputDuplication) — EAC captures
+         GPU frames and ships them to the server for visual overlay
+         detection (ESP / aimbot crosshair detection)
+       - Input anomaly detection (SendInput vs human mouse curves)
+       - Integrity timer — CRC of game .text pages (hooks by the
+         cheat would change these)
+       - Network transport (TLS to EAC backend with pinned cert)
+       - Local rules engine (loads rules.bin, decrypts, runs YARA-
+         like scans against loaded modules)
+  4. For each grouping, document:
+       - entry function name (RVA)
+       - what it reads
+       - what it reports
+       - what byte pattern triggers a "cheat" verdict
+  5. Pay special attention to the "ban trigger" path. Not every scan
+     bans immediately. Most scans tag a session; the ban is issued
+     backend-side hours/days later (this is why waves happen on
+     Tuesdays historically). The telemetry opcodes carry severity
+     tags — enumerate them.
+
+Output artifact: eac_x64_map.md with every scan routine labeled.
+
+----------------------------------------------------------------------
+5.4  Certificate pinning + network transport
+----------------------------------------------------------------------
+Goal: Understand how EAC talks to its backend and how its cert pin is
+enforced. Needed for traffic analysis.
+
+Steps:
+  1. Find the TLS client. EAC uses its own TLS stack (statically linked
+     mbedTLS or BoringSSL fork, varies by version). Look for strings
+     like "TLS 1.2 handshake failed", "cert chain" in the DLL.
+  2. Find the pin check function. It calls memcmp of a sha256 against
+     a hardcoded 32-byte blob after cert parse.
+  3. Patch the pin for research: replace the memcmp with
+     mov al, 1; ret. This lets mitmproxy sit between EAC and the
+     backend with your CA.
+  4. Document the request/response schemas (protobuf-ish or custom
+     framed binary). Capture one full session; reverse the framing.
+
+Output artifact: eac_network.md with every endpoint, request type,
+response type, and a working mitmproxy script.
+
+----------------------------------------------------------------------
+5.5  Fortnite game-side integrity (inside FortniteClient-...-Shipping.exe)
+----------------------------------------------------------------------
+Goal: Map every call the game makes INTO EAC, and every anti-cheat check
+Epic ships inside the game itself.
+
+Steps:
+  1. Unreal Engine symbol work: Fortnite is UE5 (currently). Pull a
+     matching UE5 PDB if any public dump exists; otherwise generate
+     type info via UE's reflection system (Fortnite dumps are public
+     via projects like unreal-dumper).
+  2. Locate EAC integration layer. UE has IAntiCheatModularFeature;
+     Fortnite's binding lives in a module that calls EAC_x64 exports
+     by ordinal. Enumerate those ordinals.
+  3. Trace game-side checks independent of EAC:
+       - UFUNCTION RPC validation server-side (speed hacks, teleport)
+       - Movement authority (server-authoritative; the client hint
+         is checked against physics)
+       - Fire rate / recoil validation
+       - FOV checks (FOV changer bans are server-side)
+  4. Document the "kick / soft-ban / hard-ban" taxonomy. Fortnite has
+     at least three enforcement tiers; the client code paths differ.
+
+Output artifact: fortnite_integrity_map.md.
+
+----------------------------------------------------------------------
+5.6  Settings.json and rules.bin
+----------------------------------------------------------------------
+Goal: Recover the rule set in plaintext.
+
+Steps:
+  1. Settings.json is JSON but partially base64'd in some fields.
+     Decode fully; document every key.
+  2. rules.bin is encrypted. Key derivation is inside EAC_x64.dll:
+       - Static root key (16 bytes) XOR'd with a per-version salt.
+       - AES-128-CBC in most versions, IV in file header.
+     Find the decrypt function by xrefs to the filename string
+     "rules.bin" or by looking for AES SBOX constants (0x63, 0x7c,
+     0x77, 0x7b ...).
+  3. After decrypt, you'll have:
+       - module blacklist (hashes + names)
+       - process blacklist
+       - string signatures ("cheat engine", "InternalCheatConsole",
+         etc.)
+       - byte-pattern signatures (YARA-equivalent)
+       - driver blacklist (service names + driver image hashes)
+
+Output artifact: rules.decoded.txt with the full plaintext ruleset.
+
+----------------------------------------------------------------------
+5.7  EasyAntiCheat_EOS (if present — repeat 5.1–5.4 for EOS variant)
+----------------------------------------------------------------------
+Mostly the same workflow. Differences to document:
+  - Transport is HTTPS to api.epicgames.dev (EOS SDK), not the legacy
+    easy.ac endpoints.
+  - Driver is smaller; the EOS client pushes more scans to user mode
+    behind VMP. Some scans are gated on EOS entitlement state.
+  - Shares the handle-stripping ObRegisterCallbacks pattern.
+
+----------------------------------------------------------------------
+5.8  BattlEye (only if auditing old Fortnite builds)
+----------------------------------------------------------------------
+BattlEye is structurally similar but with different conventions:
+  - BEDaisy.sys — kernel driver, callbacks + anti-debug.
+  - BEClient.dll — user-mode agent, calls BEService over LPC.
+  - BEService.exe — persistent service, update channel to battleye.com.
+Reverse in the same order: service -> driver -> client DLL -> rules.
+BattlEye's packer is NOT VMProtect; it's a custom packer with VM
+layer. Research prior art: Game Deception forum threads, and the
+"BE RE" series by various authors.
+
+================================================================================
+SECTION 6 — RECOMMENDED WORK ORDER (do them in this sequence)
+================================================================================
+
+Day 1-2:   File acquisition. Pull every file in Section 1. Hash. Snapshot.
+Day 3-4:   Kernel driver static pass (5.2). Enumerate callbacks + IOCTLs.
+           This is the backbone — everything else talks to it.
+Day 5-7:   User-mode agent DLL (5.3). Devirt VMProtect. Label functions.
+Day 8:     rules.bin decrypt (5.6). Big payoff for low effort.
+Day 9:     Pipe protocol (5.1). Short.
+Day 10-11: Network + pin (5.4). Set up mitm with patched DLL.
+Day 12-14: Game-side integrity (5.5). Longest UE5 reversing pass.
+Day 15:    EAC-EOS delta (5.7).
+Day 16:    (Optional) BattlEye historical (5.8).
+Day 17-18: Consolidate everything into a single reversed-architecture
+           document. This is the deliverable.
+
+Scale all of these up 2x if you're new to kernel RE or VMProtect devirt.
+
+================================================================================
+SECTION 7 — OPERATIONAL NOTES (for YOUR machine)
+================================================================================
+
+  - NEVER reverse on your gaming account's machine. EAC telemetry runs
+    continuously; even static analysis tools (IDA, Cheat Engine)
+    running next to Fortnite can flag your hardware ID.
+  - Dedicated VM, preferably with:
+      * Fresh Windows install
+      * Hyper-V enabled for driver debugging
+      * Second NIC for isolation
+      * Snapshots BEFORE every Fortnite launch
+      * Hidden-hypervisor build if you want to run actual Fortnite
+        inside the VM (not needed for pure static work)
+  - If you DO want to run Fortnite under instrumentation, your
+    hardware ID (motherboard serial, disk serials, MAC) will be
+    captured by EAC. Do this on a throwaway machine or expect a
+    hardware-tied flag.
+  - Kernel driver work on your host: test signing mode disables
+    Secure Boot and HVCI. Don't do this on your daily machine.
+  - Keep two separate copies of every file pulled: one you analyze,
+    one you NEVER touch. EAC updates will overwrite your working
+    copies silently if the service runs.
+  - PatchGuard is your friend: on modern Windows, EAC cannot inline-
+    hook ntoskrnl, so it uses legal callback APIs. This bounds what
+    they can do — document those bounds.
+
+================================================================================
+SECTION 8 — KNOWN PUBLIC PRIOR ART (read these first)
+================================================================================
+
+  - Secret Club: "How anti-cheats detect system emulation"
+  - Secret Club: "Exploiting a bug in EasyAntiCheat's integrity checks"
+  - can1357 / NoVmp (GitHub) — VMProtect devirtualizer
+  - VTIL-Core (GitHub) — virtualization-agnostic IL
+  - Mellow's blog — EAC teardowns
+  - momo5502 / EmulatorFixer — case study: emulator fingerprinting
+  - UnknownCheats forum threads (filter for EAC + Fortnite, sort by
+    reputation; be careful which binaries you pull — many are
+    trojaned, use only ones with hash matches against your installed
+    copy)
+  - Microsoft Learn: kernel callback APIs documentation (reference
+    material for callback semantics you'll see in EAC.sys)
+
+Clone these repos before you need them:
+  git clone https://github.com/can1357/NoVmp
+  git clone https://github.com/vtil-project/VTIL-Core
+  git clone https://github.com/hasherezade/pe-sieve
+  git clone https://github.com/wbenny/HyperDbg
+  git clone https://github.com/derrekr/Spectre     # old but useful kernel ref
+
+================================================================================
+SECTION 9 — DELIVERABLE LAYOUT (what the finished reversal looks like)
+================================================================================
+
+When all of Sections 5.1–5.8 are complete, your output tree should look like:
+
+  fortnite-ac-reversal/
+    binaries/
+      original/                     sha256-hashed, never modified
+      dumped/                       memory dumps + fixed IATs
+      devirt/                       NoVmp outputs + hand-fixed IDBs
+    docs/
+      00-overview.md
+      01-pipe-protocol.md
+      02-eac-sys-kernel.md
+      03-eac-x64-usermode.md
+      04-network-pin-telemetry.md
+      05-fortnite-integrity.md
+      06-rules-plaintext.txt
+      07-eac-eos-delta.md
+      08-battleye-historical.md     (optional)
+    idbs/                           IDA databases, one per binary
+    scripts/
+      mitmproxy_eac.py              traffic capture
+      rulesbin_decrypt.py           rules.bin plaintext tool
+      ioctl_enum.py                 IDA script to enumerate IOCTLs
+      vmp_unflat.py                 VTIL-driven unflattener
+    captures/
+      network/                      pcaps
+      memory/                       raw memory dumps
+
+================================================================================
+SECTION 10 — STOP CONDITIONS
+================================================================================
+
+You are "done reversing Fortnite anti-cheat" when you can answer all of:
+
+  Q1  Name every kernel callback EAC installs and what each one does.
+  Q2  Enumerate every IOCTL the driver exposes with input/output types.
+  Q3  Provide the plaintext of rules.bin for the current version.
+  Q4  Describe every scan performed by EAC_x64.dll with trigger, cadence,
+      and telemetry severity.
+  Q5  Given a packet capture, decode every EAC telemetry message.
+  Q6  Enumerate every check in the Fortnite binary that is NOT delegated
+      to EAC (game-side integrity).
+  Q7  Diff EAC classic vs EAC-EOS at the behavior level.
+  Q8  Identify the exact mechanism behind handle stripping and the exact
+      PreOperation callback code that implements it.
+
+If any one of these is "I don't know," you are not done. Go back to that
+section.
+
+================================================================================
+APPENDIX A — DOWNLOAD CHECKLIST (one-page pull list)
+================================================================================
+
+Copy from <FORTNITE>\FortniteGame\Binaries\Win64\EasyAntiCheat\:
+  [ ] EasyAntiCheat.exe
+  [ ] EasyAntiCheat_launcher.exe
+  [ ] EasyAntiCheat_x64.dll
+  [ ] EasyAntiCheat.sys
+  [ ] Settings.json
+  [ ] pbrules.bin (or rules.bin)
+  [ ] *.pem / cert.dat
+  [ ] easyanticheat_*.txt
+
+Copy from <FORTNITE>\FortniteGame\Binaries\Win64\EasyAntiCheat_EOS\:
+  [ ] EasyAntiCheat_EOS.exe
+  [ ] EasyAntiCheat_EOS_x64.dll
+  [ ] EasyAntiCheat_EOS.sys
+  [ ] Certificates\*
+  [ ] SplashScreen.png (version marker)
+
+Copy from <FORTNITE>\FortniteGame\Binaries\Win64\:
+  [ ] FortniteClient-Win64-Shipping.exe
+  [ ] FortniteClient-Win64-Shipping_EAC.exe
+  [ ] FortniteClient-Win64-Shipping_EAC_EOS.exe
+  [ ] FortniteLauncher.exe
+
+Copy from C:\Program Files (x86)\EasyAntiCheat\ and
+           C:\Program Files (x86)\Common Files\EasyAntiCheat\:
+  [ ] EasyAntiCheat_Setup.exe
+  [ ] all *.sys / *.dll / *.exe
+  [ ] service registry export (reg export HKLM\SYSTEM\...\EasyAntiCheat)
+
+Capture at runtime with Wireshark + mitmproxy (needs pin patch, see 5.4):
+  [ ] full session pcap from launch -> match -> quit
+  [ ] all HTTP bodies from modules-cdn.eac-prod.on.epicgames.com
+  [ ] all HTTP bodies from api.epicgames.dev (EOS variant)
+
+Hash and archive EVERYTHING before touching it:
+  for %f in (*) do (certutil -hashfile %f SHA256 >> hashes.txt)
+
+================================================================================
+APPENDIX B — QUICK REFERENCE: KERNEL CALLBACK APIs EAC USES
+================================================================================
+
+  PsSetCreateProcessNotifyRoutineEx         — new process hook
+  PsSetCreateThreadNotifyRoutine            — new thread hook
+  PsSetLoadImageNotifyRoutine               — image load hook
+  ObRegisterCallbacks(PsProcessType, ...)   — handle strip (process)
+  ObRegisterCallbacks(PsThreadType, ...)    — handle strip (thread)
+  CmRegisterCallbackEx                      — registry monitor
+  MmGetSystemRoutineAddress                 — symbol resolution
+  ZwQuerySystemInformation                  — module/process enum
+  MmCopyVirtualMemory                       — cross-process read
+  KeStackAttachProcess                      — context switch for scan
+  PsLookupProcessByProcessId                — EPROCESS from PID
+
+Each of these must be enumerated with EAC's specific callback routine
+address, documented, and its flagging logic reversed.
+
+================================================================================
+END OF DOCUMENT
+================================================================================
