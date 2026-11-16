@@ -1,0 +1,41 @@
+# Build outputs
+*.obj
+*.exp
+*.lib
+*.pdb
+*.ilk
+*.dll
+*.exe
+
+# IDA / Ghidra databases that shouldn't live here
+*.idb
+*.i64
+*.id0
+*.id1
+*.id2
+*.nam
+*.til
+*.ghidra/
+
+# Editor junk
+.vscode/
+.vs/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Captured artifacts people might accidentally commit
+*.pcap
+*.pcapng
+*.dmp
+*.minidump
+dumps/
+captures/
+
+# Allow committed PoC source but not its built DLL
+!poc/eac-emu-stub/eac_emu_stub.c
+!poc/eac-emu-stub/eac_emu_stub.def
+!poc/eac-emu-stub/build.bat
+!poc/eac-emu-stub/README.md

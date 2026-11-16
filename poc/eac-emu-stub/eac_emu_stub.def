@@ -1,0 +1,25 @@
+LIBRARY EasyAntiCheat_x64
+EXPORTS
+    ; EOS-style exports — names are stable per EOS SDK public headers.
+    EOS_Platform_GetAntiCheatClientInterface                @1
+    EOS_AntiCheatClient_BeginSession                        @2
+    EOS_AntiCheatClient_EndSession                          @3
+    EOS_AntiCheatClient_PollStatus                          @4
+    EOS_AntiCheatClient_ReceiveMessageFromServer            @5
+    EOS_AntiCheatClient_RegisterPeer                        @6
+    EOS_AntiCheatClient_UnregisterPeer                      @7
+    EOS_AntiCheatClient_ReceiveMessageFromPeer              @8
+    EOS_AntiCheatClient_AddNotifyClientIntegrityViolated    @9
+    EOS_AntiCheatClient_RemoveNotifyClientIntegrityViolated @10
+
+    ; Classic EAC exports — ordinals here are PLACEHOLDERS. For a
+    ; real drop-in against a specific Fortnite build, replace with
+    ; ordinals lifted from CFF Explorer against the real
+    ; EasyAntiCheat_x64.dll that ships with your target build.
+    EAC_Client_Init                                         @20
+    EAC_Client_Shutdown                                     @21
+    EAC_Client_PollStatus                                   @22
+    EAC_Client_RegisterPeer                                 @23
+    EAC_Client_UnregisterPeer                               @24
+    EAC_Client_ReceiveMessage                               @25
+    EAC_Client_GetProtectedData                             @26
