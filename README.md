@@ -33,6 +33,7 @@ Current-build era: **late-2026** (EAC agent `EAC_2026_*`, Fortnite UE5).
 | 16 | [Telemetry endpoints](docs/16-telemetry-endpoints.md) | Exact URLs, headers, event catalog, body format, named kernel objects, MITM method. |
 | 17 | [Trust-score model & feature flags](docs/17-trust-score-model.md) | How EAC decides what runs on your machine. The per-handler feature-flag bit system. Operational signals for pre-ban-wave detection. |
 | 18 | [ETW-TI & kernel hazards](docs/18-etw-ti-and-kernel-hazards.md) | What Microsoft-Windows-Threat-Intelligence sees, PatchGuard, HVCI, DMA Protection, WDAC. The specific constraints a spoofer/cheat driver has to operate under. |
+| 19 | [Exhaustive fingerprint & trace catalog](docs/19-exhaustive-fingerprint-trace-surface.md) | **The catch-all.** Every CPU identifier (every CPUID leaf, every relevant MSR), every SMBIOS table, every storage/network/display/USB/audio/power field, every ETW provider, every on-disk forensic artifact, every PCR, every spoofable-vs-not. Use as reference, not linear read. |
 
 ### Focused sections
 
