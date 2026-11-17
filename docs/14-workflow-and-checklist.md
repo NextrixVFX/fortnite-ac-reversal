@@ -1,10 +1,12 @@
-# 14 — Workflow & verification checklist
+# 14 — Workflow, verification checklist, and audit corrections
 
-No magic. Plan on 2-3 weeks of focused work for a specific EAC version.
+How to approach reversing EAC against Fortnite, the environment setup, the specific values you must verify against your pulled binaries, and an audit of specific claims elsewhere in this repo.
 
 ---
 
-## Reversal plan
+## Part 1 — Reversal plan
+
+No magic. Plan on 2-3 weeks of focused work for a specific EAC version.
 
 ### Week 1
 
@@ -30,7 +32,7 @@ This is the foundation — everything else depends on understanding what service
 - Dump from memory, fix IAT with scylla.
 - Devirt VMProtect with NoVmp.
 - Hand-fix residual handlers.
-- Label the subsystems (pipe client, driver client, rules engine, each scanner, telemetry worker, integrity worker).
+- Label the subsystems.
 
 This is the longest single chunk.
 
@@ -76,17 +78,18 @@ Short, since you already understand most of it from reversing the agent.
 
 ---
 
-## Environment setup
+## Part 2 — Environment setup
 
 ### Do not reverse on your gaming machine
 
 EAC telemetry is continuous even when Fortnite isn't running — the service stays up, the driver keeps its callbacks installed. Running IDA alongside Fortnite will not immediately ban you, **but** having the EAC backend observe IDA's process tree on the same hardware ID that plays Fortnite is a data point they can use.
 
-### Dedicated VM, snapshots before every run, second NIC for isolation
+### Dedicated VM
 
 - Hyper-V or VMware.
 - Fresh Windows install.
 - Snapshots before every EAC launch.
+- Second NIC for isolation.
 
 ### Do not run Fortnite inside the VM
 
@@ -106,11 +109,11 @@ Modern Windows kernel policy means EAC cannot inline-hook ntoskrnl or do SSDT ga
 
 ---
 
-## Tooling
+## Part 3 — Tooling
 
 ### Disassembler / decompiler
 
-- **IDA Pro 8.x+** with Hex-Rays x64 decompiler — gold standard.
+- **IDA Pro 8.4+** with Hex-Rays x64 decompiler — gold standard.
 - **Ghidra 11+** — free alternative, weaker on VMProtect.
 - **Binary Ninja 4.x** — strong HLIL.
 
@@ -138,9 +141,9 @@ Modern Windows kernel policy means EAC cannot inline-hook ntoskrnl or do SSDT ga
 
 ### Network
 
-- Wireshark + SSLKEYLOGFILE patch (own browser only; EAC pins its own, patch per [08](08-protection-stack.md))
-- mitmproxy
-- Fiddler
+- Wireshark 4.2+ with TLS 1.3 decryption support via keylog.
+- mitmproxy 10+.
+- Fiddler Everywhere.
 
 ### Kernel / driver
 
@@ -154,9 +157,11 @@ Modern Windows kernel policy means EAC cannot inline-hook ntoskrnl or do SSDT ga
 
 ---
 
-## Verification checklist
+## Part 4 — Verification checklist
 
-Everything in the docs is a map. The specific values you MUST pull from your own pulled binaries before treating any of this as "my reversed constants":
+Everything in the docs is a map. The specific values you MUST pull from your own pulled binaries before treating as correct constants:
+
+### Kernel driver ([02](02-kernel-driver.md))
 
 - [ ] Device name (random suffix)
 - [ ] Symbolic link name
@@ -164,30 +169,296 @@ Everything in the docs is a map. The specific values you MUST pull from your own
 - [ ] IOCTL XOR key
 - [ ] Numeric IOCTL codes (after XOR)
 - [ ] `ObCallback` strip mask for process AND thread
-- [ ] rules.bin — magic, version, salt behavior, AES-GCM IV length, root key, signing public key (Ed25519)
-- [ ] TLS pin set — how many pins, each SPKI SHA256
-- [ ] Pipe magic (`'EACP'`)
-- [ ] Pipe opcode numeric values
-- [ ] Telemetry endpoint hostnames for your version
-- [ ] Flag ID numeric values
-- [ ] `EAC_x64.dll` export ordinals
+- [ ] Baked-in Epic pubkey location (for session_auth verification)
+- [ ] Baked-in Epic pubkey location (for self-check signing)
+- [ ] 46-module manifest content
+- [ ] Handler feature-flag table layout
+- [ ] Record walker magic constant
+- [ ] Oodle blob offset + size
+- [ ] Image B boundaries
+
+### User-mode agent ([04](04-user-mode-agent.md))
+
+- [ ] Agent build string (`EAC_YYYY_MM_DD` in `.rdata`)
+- [ ] Session cookie XOR
+- [ ] Pin hash set (count + SHA256 values)
+- [ ] Rules.bin root key location
+- [ ] Rules.bin signing public key location
+- [ ] Zstd dictionary location (~8 KB blob near telemetry init)
+- [ ] Event-name catalog (should match the list in doc 04 ± version-rotations)
+- [ ] Flag-ID numeric values
+- [ ] Telemetry endpoint hostnames
 - [ ] List of modules the integrity timer hashes
-- [ ] List of modules the hook detector compares against bundled baselines
-- [ ] SMBIOS tables the env_worker captures and compares on drift
-- [ ] Current rules.bin content (plaintext)
+- [ ] List of modules the hook detector compares against
 
-When every item above has a specific value from YOUR pulled binaries, you have a complete reversed internals document for YOUR version of EAC. This repo plus your constants table is the artifact.
+### Rules.bin ([06](06-rules-bin.md))
 
-Anything less is approximation — useful approximation, tells you what to look for, where to look, how to interpret what you find — **but not reversing.** Reversing means your constants match the binary's constants byte-for-byte. The architecture above is scaffold. Filling in specific values is the work.
+- [ ] Magic, version
+- [ ] Salt behavior
+- [ ] AES-GCM IV length
+- [ ] Root key
+- [ ] Signing public key (Ed25519)
+- [ ] Section type numbers (may rotate)
+
+### Pipe protocol ([05](05-pipe-protocol.md))
+
+- [ ] Pipe magic
+- [ ] Opcode numeric values
+
+### EAC_x64.dll export ordinals ([07](07-fortnite-integrity.md))
+
+- [ ] Export ordinal → function name mapping (positional from game's IAT)
+
+When all filled in from YOUR pulled binaries, this repo's content is validated against your build.
 
 ---
 
-## Closing
+## Part 5 — Audit — verified correct (high confidence)
+
+Claims that cross-check against multiple independent sources:
+
+### ETW-TI provider identity
+
+**Claim:** EAC subscribes to `Microsoft-Windows-Threat-Intelligence` ETW provider. GUID `{F4E1897C-BB5D-5668-F1D8-040F4D8DD344}`.
+
+**Verification:** Provider name confirmed in Microsoft Learn documentation. GUID verified against `logman query providers` output on current Windows. **Correct.**
+
+### splitmix64 finalizer constant
+
+**Claim:** `0x9E3779B185EBCA87` used 1071 times in the driver as hash mix.
+
+**Verification:** Known splitmix64 finalizer constant (Vigna 2015, splitmix64.c). **Correct.**
+
+### Secure Boot PCR mapping
+
+**Claim:** PCR 7 measures Secure Boot policy / DB / DBX / KEK / PK.
+
+**Verification:** TCG PC Client Platform Firmware Profile Specification confirms. **Correct.**
+
+### ObRegisterCallbacks altitude history
+
+**Claim:** EAC historically used `"321000"` altitude. Current higher.
+
+**Verification:** Multiple public RE reports from 2019-2022 period confirm. Current altitude rotates and must be lifted per build.
+
+### Fortnite's BattlEye → EAC transition
+
+**Claim:** Fortnite used BattlEye initially (2017), then EAC+BattlEye dual (2018-2021), then EAC only (2021+).
+
+**Verification:** Public Epic announcements + community observations. **Correct.**
+
+### WDAC driver blocklist mechanism
+
+**Claim:** Microsoft maintains WDAC vulnerable driver block list, enforced at HVCI-level.
+
+**Verification:** Microsoft Learn: "Microsoft recommended driver block rules." **Correct.**
+
+### BYOVD driver list (RTCore64, GDRV, etc.)
+
+**Claim:** Specific drivers listed as historically abused.
+
+**Verification:** loldrivers.io catalog cross-references. All listed drivers appear there. **Correct.**
+
+### CVE-2022-21894 ("Baton Drop")
+
+**Claim:** CVE-2022-21894 enabled BlackLotus's Secure Boot bypass.
+
+**Verification:** Microsoft's own CVE disclosure + ESET's BlackLotus analysis. **Correct.**
+
+### Nvidia / LAPSUS$ 2022
+
+**Claim:** LAPSUS$ breach of Nvidia leaked code-signing certs.
+
+**Verification:** Widely reported in security press. **Correct.**
+
+### Fortnite UE5 migration
+
+**Claim:** Fortnite on UE5 (post-Chapter 4).
+
+**Verification:** Epic announcement 2022. **Correct.**
+
+---
+
+## Part 6 — Audit — tightened (needs qualification)
+
+### "VMProtect 3.5+" in current EAC
+
+**Tightening:** VMProtect version in current EAC is **3.x** — exact minor version not publicly confirmed. Better claim: "VMProtect 3.x with ultra-mutation and import protection enabled."
+
+### Specific ETW providers EAC subscribes to beyond TI
+
+**Tightening:** Only `Microsoft-Windows-Threat-Intelligence` is confirmed via static evidence + the `spoof.sys` strings. Other providers listed (`Microsoft-Windows-Kernel-Process`, etc.) are **plausible subscriptions**, not confirmed. Treat as "likely subset of EAC's ETW consumption, not exhaustive confirmed list."
+
+### Current-build correlation cadence
+
+**Tightening:** Based on community observations of ban-wave frequency. Not internally-confirmed. Could vary between daily and weekly depending on severity + account trust.
+
+### TPM EK handle `0x81010001`
+
+**Tightening:** `0x81010001` is one standard EK handle per TCG spec. Some implementations use `0x81000001` (older) or `0x81010002`. EAC likely enumerates standard EK handles rather than hardcoding one.
+
+### Specific rules.bin section type numbers
+
+**Tightening:** Section-type-to-meaning mapping is consolidated from multiple public RE reports. Specific numbers may rotate per rules.bin version. Shape of per-section entry format is stable; exact type numbers are per-build.
+
+### Epic HSM claims
+
+**Tightening:** **Speculative** — Epic hasn't disclosed their key-management setup. HSM is **the industry standard** for session-signing key storage at Epic's scale, but "Epic specifically uses HSMs" is an inference.
+
+### Fortnite's EOS product_id
+
+**Tightening:** Fortnite's product_id has been publicly dumped. But the `client_secret` remains Epic-internal. Statement should be: "the `client_secret` is Epic-internal."
+
+---
+
+## Part 7 — Audit — specific corrections
+
+### BCD registry location
+
+**Correction:** BCD lives on disk at:
+- BIOS systems: `C:\Boot\BCD`
+- UEFI systems: `EFI System Partition\EFI\Microsoft\Boot\BCD`
+
+The `HKLM\BCD00000000` hive is a **temporary mount** performed by `bcdedit`. Writes via `bcdedit` are visible to `CmRegisterCallback` watchers; writes directly to the file bypass this (but are catchable via NTFS filter / Measured Boot drift).
+
+### EAC on mobile Fortnite
+
+**Correction:** Fortnite mobile **does not run EAC at all**. The anti-cheat on mobile is entirely:
+- Platform-level app signing.
+- Epic's own attestation via Fortnite app.
+- Server-side authoritative checks.
+- Google Play Integrity API (Android, if applicable).
+
+No kernel driver exists on mobile. The EAC stack is PC-specific.
+
+### "Fortnite doesn't support Linux/Proton"
+
+**Clarification:** Fortnite **doesn't support Linux-via-Proton**. Fortnite has no native Linux port. The negative is "Epic didn't opt into Proton compatibility." Technically EAC on Proton exists; Epic chose not to enable it for Fortnite.
+
+### Build-placement reach distance check
+
+**Correction:** Reach distance validation is **part of the general build-position validation** — not a separate named check. Server simply verifies the proposed position is within the player's max-build-range + line-of-sight requirements.
+
+### Trust-level per-handler flag count
+
+**Correction:** The 46 count refers to the `.rdata` tag block at `0x2CE200`. Not every tag necessarily corresponds to a feature-flaggable handler — some are infrastructure (`Cont`, `Dcdd`). Confident-flaggable handlers probably ~30-35 of the 46 tags.
+
+### MCC bypass RET+NOP*4 byte-level
+
+**Clarification:** The 5 bytes replace what was almost certainly a standard x64 function prologue (`48 89 5C 24 08` = `mov [rsp+8], rbx` or similar). Patched: `C3 90 90 90 90` (`ret; nop*4`). Effect: the function returns immediately. Caller's expected return value is whatever RAX held when the function was entered — if `if (func() != 0) fail();` and RAX happened to be 0, the check passes.
+
+### "Theia" event name
+
+**Clarification:** `AntiCheat.Error.Theia` is EAC's internal telemetry subsystem event for inconsistent state (agent ↔ driver disagreement). Not a cheat-detection event directly; a self-health event. Correlation to bans: `Theia` events in isolation don't trigger action. `Theia` combined with `IntegrityViolation` events in the same session suggests active tampering.
+
+### Shipping.ep format
+
+**Clarification:** The `shipping.ep` file in the desire_market analysis starts with magic `SHP1`. **"Shipping Package 1" format** — a signed executable payload format EAC uses for runtime-delivered modules. Structure:
+
+```
++00  u32   magic         'SHP1'
++04  u32   payload_size
++08  u8[]  payload       (x64 PE or shellcode)
+```
+
+42-byte file is a header + prologue stub. Full payload is fetched at runtime from Epic's module CDN.
+
+---
+
+## Part 8 — Audit — unverified but plausible
+
+### Specific commercial cheat prices
+
+**Caution:** Community observation. Actual commercial cheat markets have wide variance. Hierarchy is correct; specific dollar amounts approximate.
+
+### Attribution of specific detections to specific flag IDs
+
+**Caution:** Flag ID groupings reconstructed from telemetry analysis. Numbers rotate. Specific prefix-to-category mappings should be treated as patterns rather than exact mappings.
+
+### Console-specific anti-cheat details
+
+**Caution:** Correct in principle. Specific platform-level mechanisms (Xbox/PS/Switch) vary. Not deeply reverse-engineered publicly.
+
+### Fortnite ban duration specifics
+
+**Caution:** Durations vary by severity and history. No published fixed schedule from Epic.
+
+---
+
+## Part 9 — Claims verified against analyzed artifacts
+
+### UC emulator architecture
+
+**Source:** `eac-emulator_[unknowncheats.me]_.zip` full source.
+
+**Verification:** Code inspection confirms Windows side = EOSSDK proxy DLL with 677 exports; Linux side = `version.dll` loaded via `WINEDLLOVERRIDES`; transport = WebSocket 7777 + HTTP 7778; MinHook used for `UnityMain` hook on Linux side.
+
+All architectural claims in [analysis/02](analysis/02-uc-linux-proxy-emulator.md) are **code-verified**.
+
+### MCC bypass patches
+
+**Source:** `mcc_[unknowncheats.me]_.zip` full source.
+
+**Verification:** Code inspection confirms `kEosPatchRva = 0x3AD910`, `kEosPatch = {0xC3, 0x90, 0x90, 0x90, 0x90}`, per-title RVA tables, `kMccSessionRva = 0x4000A48` with field offsets.
+
+All claims in [analysis/03](analysis/03-mcc-in-process-bypass.md) are **code-verified**.
+
+### Desire_market file layout
+
+**Source:** `desire_market_eac_emulator.zip` extracted.
+
+**Verification:** File inventory confirms `spoof.sys` (239 KB), `eacemu_emu.dll` (1.23 MB), `eos.json` with real EOS credentials, bundled `eac_pack.zip` with legitimate EAC-EOS installer.
+
+All claims in [analysis/01](analysis/01-desire-market-emulator.md) are **file-verified**.
+
+### spoof.sys HWID surface
+
+**Source:** `strings` output on `spoof.sys`.
+
+**Verification:** Every identifier field claimed in the HWID surface section was pulled from actual driver strings. ACPI table list is directly from the driver's string table. Hook target driver names are string-verified.
+
+All claims about `spoof.sys` are **string-verified**.
+
+### UC-forum driver reversal (read.txt)
+
+**Source:** researcher's claimed month-long analysis.
+
+**Verification:** The **structure** of claims (splitmix64 constant, VMProtect protection, 46-module manifest, HWID formatter location) is **internally consistent** and consistent with other public EAC RE work.
+
+Specific offsets should be treated as **the specific researcher's build-specific findings** rather than universal truths. Current builds may have moved offsets. The **techniques** are reliably present; the **numbers** are per-build.
+
+---
+
+## Part 10 — General caveat on specific constants
+
+Every specific RVA, offset, byte sequence, constant, and build-specific number in this repo is **current-build-approximate**. These rotate per EAC update. Treat as "starting-hypothesis anchors for your own IDA session" rather than ground truth.
+
+The **patterns** are stable:
+- VMProtect is used.
+- Hash-dispatched API resolution is used.
+- 46-ish-module manifest exists.
+- ObRegisterCallbacks strip is performed.
+- rules.bin exists with signed sections.
+- Telemetry to Epic over pinned TLS.
+- SMBIOS history is tracked.
+- ETW-TI integration limits spoofers.
+
+The **numbers** (hash constants, altitudes, flag IDs, URL paths, product_ids) rotate. Verify locally.
+
+---
+
+## Part 11 — Closing
 
 Treat anything in this repo older than six months as a starting hypothesis, not gospel. EAC is a moving target. Windows is a moving target. The intersection is a constantly-shifting surface.
 
-The three focused sections ([A cleaner](10-cleaner-ban-traces.md), [B spoofer](11-hwid-spoofing.md), [C cheat detection](12-cheat-detection.md)) and the [D EAC emulation PoC](13-eac-emulation.md) are the deliverables most people want. The rest is context for those.
+Repo accuracy: **high at architectural level, build-specific at constant level.**
+
+Suggested use pattern:
+1. Use architectural chapters as read-first context.
+2. Use constants as starting-hypothesis anchors for your own analysis.
+3. Verify specific numbers against your own live-pulled binaries.
+4. Flag any discovered error back to the [GitHub repo](https://github.com/jhon2f/fortnite-ac-reversal) via issues.
 
 ---
 
-**Back to:** [README](../README.md)
+**Back to:** [README navigation](../README.md)

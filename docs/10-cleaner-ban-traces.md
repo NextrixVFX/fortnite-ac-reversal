@@ -1,60 +1,53 @@
-# A — Cleaner & ban traces
+# 10 — Cleaner & ban traces (all on-disk + registry artifacts)
 
-The surface involved in **"this machine was flagged / banned"** and **"this hardware is the same hardware that was banned"**. Two overlapping concerns:
+The surface involved in **"this machine was flagged / banned"** and **"this machine ran Fortnite / EAC N times."** Two overlapping concerns:
 
 | | Concern | Lives in |
 |-|-|-|
 | **(a)** | On-DISK traces correlating "your machine" to "this account's ban" via log files, caches, registry, event logs. | Filesystem + registry + system event logs |
-| **(b)** | Live-queried machine identifiers correlating "your hardware" to "banned hardware" via hardware fingerprinting. | Hardware + firmware + OS install state |
+| **(b)** | Live-queried machine identifiers correlating "your hardware" to "banned hardware" via hardware fingerprinting. | See [11 HWID spoofing](11-hwid-spoofing.md) |
 
 **Both matter.** Cleaning only (a) when (b) is the real binding gets you nowhere. Cleaning only (b) when (a) still shows "this machine has run and been reported by EAC N times" also gets you nowhere.
 
+This doc is **the exhaustive on-disk and registry trace catalog.**
+
 ---
 
-## A.1 — On-disk traces EAC and the system leave
+## Part 1 — EAC-specific trace locations
 
-### EAC-specific trace locations
+### Main installation directories
 
 ```
-C:\ProgramData\EasyAntiCheat\                       — persistent config,
-                                                      boot cookies, cached
-                                                      session metadata
-C:\ProgramData\EasyAntiCheat_EOS\                   — same for EOS variant
-C:\ProgramData\Epic\EasyAntiCheat\Logs\             — run logs with session IDs
-%LOCALAPPDATA%\EasyAntiCheat\                       — per-user caches
+C:\ProgramData\EasyAntiCheat\                     — persistent config, boot
+                                                     cookies, cached session
+                                                     metadata
+C:\ProgramData\EasyAntiCheat_EOS\                 — same for EOS variant
+C:\ProgramData\Epic\EasyAntiCheat\Logs\           — run logs with session IDs
+%LOCALAPPDATA%\EasyAntiCheat\                     — per-user caches
 %LOCALAPPDATA%\EasyAntiCheat_EOS\
-C:\ProgramData\Epic\EpicGamesLauncher\Data\Logs\   — launcher logs, which
-                                                     include EAC service
-                                                     start/stop events
-                                                     and process spawn
-                                                     records
-C:\Program Files (x86)\EasyAntiCheat\              — system install dir;
-                                                     contains the shared
-                                                     driver copy + setup
-                                                     log
-C:\Windows\System32\LogFiles\EasyAntiCheat\        — present on some
-                                                     builds; driver-side
+C:\ProgramData\Epic\EpicGamesLauncher\Data\Logs\  — launcher logs, which include
+                                                     EAC service start/stop +
+                                                     process spawn records
+C:\Program Files (x86)\EasyAntiCheat\             — system install dir; shared
+                                                     driver copy + setup log
+C:\Windows\System32\LogFiles\EasyAntiCheat\       — on some builds: driver-side
                                                      crash dumps + status
 ```
 
 ### Fortnite-specific
 
 ```
-%LOCALAPPDATA%\FortniteGame\Saved\Logs\             — client-side game logs
-                                                      with session IDs that
-                                                      Epic's backend can
-                                                      correlate
-%LOCALAPPDATA%\FortniteGame\Saved\Config\           — user-ID artifacts +
-                                                      session continuation
-                                                      data
-%LOCALAPPDATA%\FortniteGame\Saved\Crashes\          — crash reports (which
-                                                      include hardware
-                                                      fingerprints)
-%LOCALAPPDATA%\FortniteGame\Saved\WebCache*\        — web cache
+%LOCALAPPDATA%\FortniteGame\Saved\Logs\           — client-side game logs with
+                                                     session IDs Epic can
+                                                     correlate
+%LOCALAPPDATA%\FortniteGame\Saved\Config\         — user-ID artifacts + session
+                                                     continuation data
+%LOCALAPPDATA%\FortniteGame\Saved\Crashes\        — crash reports (include
+                                                     hardware fingerprints)
+%LOCALAPPDATA%\FortniteGame\Saved\WebCache*\      — web cache
 %LOCALAPPDATA%\EpicGamesLauncher\Saved\
-  DeviceIdCache*                                     — device id cache, per-
-                                                      user epic device
-                                                      fingerprint
+  DeviceIdCache*                                   — Epic device fingerprint
+                                                     cache
 ```
 
 ### Registry locations EAC writes or reads through
@@ -64,16 +57,48 @@ HKLM\SYSTEM\CurrentControlSet\Services\EasyAntiCheat
 HKLM\SYSTEM\CurrentControlSet\Services\EasyAntiCheat_EOS
 HKLM\SOFTWARE\EasyAntiCheat
 HKLM\SOFTWARE\WOW6432Node\EasyAntiCheat
-HKCU\Software\EasyAntiCheat                         — per-user cache
+HKCU\Software\EasyAntiCheat                        — per-user cache
 HKLM\SYSTEM\CurrentControlSet\Services\EasyAntiCheat\Enum
-                                                     — PnP enum entry
-HKLM\SYSTEM\Setup\LastUserShellFolders               — occasionally touched
-                                                     during install/update
+                                                    — PnP enum entry for the
+                                                      loaded driver
+HKLM\SYSTEM\Setup\LastUserShellFolders              — occasionally touched
+                                                      during install/update
 ```
 
-### Windows forensic artifacts that outlive EAC's own cleanup
+### EAC service-specific state keys
 
-#### Prefetch
+Under `SYSTEM\CurrentControlSet\Services\EasyAntiCheat_EOS\`:
+
+```
+Attestation                 — TPM attestation state
+ProductsInstalled           — list of EAC-protected products on this system
+ErrRpt_GameCrashExitStatus
+ErrRpt_LastUnloadDuration
+ErrRpt_GameState
+ErrRpt_ServiceState
+ErrRpt_GameCrashExitTime
+ErrRpt_LastInitTime
+ErrRpt_GameCrashCreateTime
+ErrRpt_LastInitSandboxId
+ErrRpt_LastInitDeploymentId
+```
+
+Accessible with any registry viewer. **Useful for ban-trace cleanup — `ErrRpt_*` values survive game-level uninstall.**
+
+### EacQuoteKey (TPM attestation binding)
+
+```
+HKLM\SYSTEM\CurrentControlSet\Services\Tpm\PlatformQuoteKeys\EacQuoteKey
+HKLM\SYSTEM\CurrentControlSet\Services\Tpm\PlatformQuoteKeys\AttestationKey
+```
+
+These are Windows per-service platform quote key storage. **If present, your TPM has been bound to an EAC session.** Clearing requires TPM clear (destroys BitLocker keys).
+
+---
+
+## Part 2 — Windows forensic artifacts that outlive EAC's cleanup
+
+### Prefetch
 
 ```
 C:\Windows\Prefetch\
@@ -82,11 +107,12 @@ C:\Windows\Prefetch\
   FORTNITECLIENT-WIN64-SHIPPING_EAC.EXE-*.pf
   FORTNITECLIENT-WIN64-SHIPPING_EAC_EOS.EXE-*.pf
   FORTNITELAUNCHER.EXE-*.pf
+  EPICGAMESLAUNCHER.EXE-*.pf
 ```
 
-Records volume paths, DLLs loaded, run count, first/last run time. **Forensic timeline gold.**
+Records volume paths, DLLs loaded, run count, first/last run time. **Forensic timeline gold.** Survives uninstall.
 
-#### Event Logs (`.evtx`)
+### Event Logs (`.evtx`)
 
 ```
 C:\Windows\System32\winevt\Logs\System.evtx
@@ -104,17 +130,21 @@ C:\Windows\System32\winevt\Logs\
 C:\Windows\System32\winevt\Logs\
   Microsoft-Windows-TaskScheduler%4Operational.evtx
   — if EAC used a scheduled task
+
+C:\Windows\System32\winevt\Logs\
+  Microsoft-Windows-CodeIntegrity%4Operational.evtx
+  — driver load CI events
 ```
 
-#### SRUM database
+### SRUM database
 
 ```
 C:\Windows\System32\sru\SRUDB.dat
 ```
 
-Per-executable network bytes transferred and runtime stats. Shows "this machine ran `EasyAntiCheat.exe` and `FortniteClient-*` and transferred N bytes to Epic endpoints." Aggregated hourly.
+Per-executable network bytes transferred and runtime stats. Shows "this machine ran `EasyAntiCheat.exe` and `FortniteClient-*` and transferred N bytes to Epic endpoints." **Aggregated hourly, kept for ~60 days.**
 
-#### BAM (Background Activity Moderator)
+### BAM (Background Activity Moderator)
 
 ```
 HKLM\SYSTEM\CurrentControlSet\Services\bam\UserSettings\<SID>
@@ -122,7 +152,7 @@ HKLM\SYSTEM\CurrentControlSet\Services\bam\UserSettings\<SID>
 
 Per-SID list of executables run and their last run time. Includes EAC and Fortnite binaries.
 
-#### MUICache
+### MUICache
 
 ```
 HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\
@@ -131,7 +161,7 @@ HKCU\Software\Classes\Local Settings\Software\Microsoft\Windows\
 
 Binary full paths and `FriendlyAppName` values for executables that ran under this user.
 
-#### Shimcache (AppCompat)
+### Shimcache (AppCompat)
 
 ```
 HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache
@@ -139,7 +169,7 @@ HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache
 
 List of executable paths + last-modified times observed. Kept across reboots, flushed to registry only at reboot.
 
-#### Amcache.hve
+### Amcache.hve
 
 ```
 C:\Windows\appcompat\Programs\Amcache.hve
@@ -147,7 +177,7 @@ C:\Windows\appcompat\Programs\Amcache.hve
 
 **The heaviest forensic witness.** Detailed record of every executable run, with SHA1 hashes of the binaries themselves. Amcache shows not just that a binary ran but the specific version.
 
-#### Jump Lists
+### Jump Lists
 
 ```
 %APPDATA%\Microsoft\Windows\Recent\AutomaticDestinations\
@@ -155,7 +185,7 @@ C:\Windows\appcompat\Programs\Amcache.hve
 
 Per-application recent-files lists.
 
-#### NTFS USN Journal
+### NTFS USN Journal
 
 ```
 $Extend\$UsnJrnl:$J
@@ -163,7 +193,7 @@ $Extend\$UsnJrnl:$J
 
 Filesystem change journal. Records creation/modification of EAC files, log files, etc. Huge, but chunks can survive long enough to matter.
 
-#### Paging / hibernation
+### Paging / hibernation
 
 ```
 C:\pagefile.sys
@@ -173,7 +203,7 @@ C:\swapfile.sys
 
 Paged-out memory from any process. Can contain literal cleartext of pipe frames, session IDs, HWID tokens that EAC computed.
 
-#### Volume Shadow Copies
+### Volume Shadow Copies
 
 ```
 vssadmin list shadows
@@ -181,172 +211,290 @@ vssadmin list shadows
 
 Point-in-time snapshots. Any snapshot made while EAC was installed contains the full forensic record above.
 
-#### WER (Windows Error Reporting) queue
+### WER (Windows Error Reporting) queue
 
 ```
 C:\ProgramData\Microsoft\Windows\WER\
+C:\Users\<user>\AppData\Local\Microsoft\Windows\WER\
 ```
 
 Cached crash dumps that haven't been uploaded yet. If Fortnite or EAC ever crashed, a minidump may be here with a full memory snapshot of the crashing process.
+
+### Memory dumps
+
+```
+C:\Windows\Minidump\*.dmp
+C:\Windows\Memory.dmp
+```
+
+Full memory snapshots on crash (if crash dump enabled). Can contain cheat DLL memory.
+
+### Browser caches
+
+```
+Edge/Chrome/Firefox profile directories
+```
+
+May contain:
+- Epic account email in form history.
+- Epic session cookies.
+- Epic launcher download history.
 
 ### Epic launcher caches
 
 ```
 C:\ProgramData\Epic\EpicGamesLauncher\
 %LOCALAPPDATA%\EpicGamesLauncher\
+C:\ProgramData\Epic\SocialBackendCache\
 ```
 
 Contain your Epic account ID, device ID cache, sessions, auth tokens. **Tied to your account even if you log out.**
 
 ---
 
-## A.2 — Live-queried machine identifiers (the HWID / fingerprint set)
+## Part 3 — Advanced forensic artifacts
 
-These are the fields EAC reads and reports to the backend as your hardware fingerprint. The backend stores a hash of some combination per session. An HWID ban blacklists that hash.
-
-### SMBIOS
-
-Read via one of:
-
-- `NtQuerySystemInformation(SystemFirmwareTableInformation, 'RSMB')` — current EAC path
-- `GetSystemFirmwareTable('RSMB', 0, buffer, size)` — user-mode equivalent
-- WMI: `Win32_BIOS` / `Win32_BaseBoard` / `Win32_ComputerSystem` / `Win32_SystemEnclosure`
-
-Fields:
-
-| Table | Field | Weight |
-|-|-|-|
-| 0 (BIOS) | vendor | low |
-| 0 | version | low |
-| 0 | release date | low |
-| 1 (System) | manufacturer | moderate |
-| 1 | product name | moderate |
-| 1 | version | low |
-| 1 | serial number | **high** |
-| 1 | **UUID** | **high (strong identifier)** |
-| 2 (Baseboard) | manufacturer | moderate |
-| 2 | product name | moderate |
-| 2 | **serial number** | **high** |
-| 3 (Chassis) | manufacturer | low |
-| 3 | serial | moderate |
-
-### Disk
+### ActivityHistory / Timeline
 
 ```
-per-physical-drive serial number via
-  IOCTL_STORAGE_QUERY_PROPERTY with StorageDeviceProperty
-per-physical-drive model + firmware via same
-NVMe identify-controller via IOCTL_STORAGE_PROTOCOL_COMMAND
-  (NVMe EUI64 + NGUID)
-per-volume serial number via GetVolumeInformation
-  (NTFS boot sector field — lower entropy than physical serial
-   but still recorded)
+%LOCALAPPDATA%\ConnectedDevicesPlatform\<id>\ActivitiesCache.db
 ```
 
-### Network
+SQLite database of app activity. Shows Fortnite / EAC launches. Only on Win 10/11.
+
+### Diagnostic data
 
 ```
-per-adapter PERMANENT MAC via NDIS IOCTL
-  (NOT the "current" MAC — asks for the burned-in one)
-per-adapter description + hardware ID from registry under
-  HKLM\SYSTEM\CurrentControlSet\Enum\PCI\...
-per-adapter IPv6 global prefix (less stable, still captured)
+C:\ProgramData\Microsoft\Diagnosis\
 ```
 
-### CPU
+ETW traces, telemetry events. Includes Fortnite + EAC activity.
+
+### Shellbags
 
 ```
-CPUID leaf 1 EAX/EBX/ECX/EDX (signature, feature flags)
-CPUID brand string (leaves 0x80000002..0x80000004)
-CPUID leaf 0x16 processor frequency (or computed TSC rate fallback)
-CPUID leaf 4 cache topology
-CPUID leaf 0x1F / 0xB extended topology — NUMA + core layout
-microcode revision via RDMSR 0x8B (kernel side)
-processor serial number via CPUID leaf 3 if available (deprecated on
-  modern CPUs but EAC still probes)
+HKCU\Software\Microsoft\Windows\Shell\Bags
+HKCU\Software\Microsoft\Windows\Shell\BagMRU
 ```
 
-### GPU
+Folder view history — shows folders you've navigated, including the Fortnite install directory.
+
+### Thumbcache
 
 ```
-adapter LUID + description via DXGI IDXGIAdapter::GetDesc1
-PCI subsystem/vendor/device IDs via setupapi
-  HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_*\DEV_*
-nvidia-specific device UUID via NVAPI (if nvidia driver present)
-intel-specific device UUID via IGCL / IGDUMD queries
-amd-specific via ADLX / AMDVLK queries
+%LOCALAPPDATA%\Microsoft\Windows\Explorer\thumbcache_*.db
+%LOCALAPPDATA%\IconCache.db
 ```
 
-### Audio / input
+Thumbnails cached when you browsed folders containing Fortnite screenshots/files.
+
+### LNK files + RecentDocs
 
 ```
-audio endpoint device IDs via IMMDeviceEnumerator
-mouse/keyboard HID paths via SetupDiGetClassDevs
+%APPDATA%\Microsoft\Windows\Recent\
+HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\RecentDocs\
 ```
 
-### Display
+Per-file shortcuts for recently opened files.
+
+### UserAssist
 
 ```
-monitor EDID via setupapi registry under
-  HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY\*\*\Device Parameters\EDID
+HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist\
 ```
 
-Contains manufacturer ID, product code, serial number, mfg date.
+ROT13-encoded app launch counts. Shows every launch of Fortnite.exe + EAC binaries.
 
-### TPM (newer builds, when present)
-
-```
-TPM endorsement key public — hash strongly stable per-TPM
-  (survives Windows reinstall; only replaced if TPM is cleared or
-   motherboard swapped)
-TPM manufacturer ID + version via TBS APIs
-```
-
-### Windows / OS identity
+### TypedPaths + OpenSaveMRU
 
 ```
-HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid
-HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProductId
-HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\DigitalProductId
-  (4 bytes of installation ID, basically unique per install)
-HKLM\SOFTWARE\Microsoft\SQMClient\MachineId
-current user SID from the user token
-Windows build number + revision
+HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\TypedPaths\
+HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\ComDlg32\
 ```
 
-### Firmware tables beyond SMBIOS
+Address-bar typed paths + file-dialog history.
+
+### RDP connection history
 
 ```
-ACPI tables via NtQuerySystemInformation(SystemFirmwareTableInformation, 'ACPI')
-  — ACPI OEM ID + OEM table ID
-  — MSDM table on OEM machines (contains OEM Windows product key)
-PCI config space for each device via IoGetDeviceProperty
-  — driver-side; EAC's driver can enumerate all PCI devices and hash
+HKCU\Software\Microsoft\Terminal Server Client\
 ```
 
-### Boot / firmware state
+Remote desktop connection history.
+
+### Windows Push Notification db
 
 ```
-UEFI firmware vendor + version via GetFirmwareEnvironmentVariable
-Secure Boot state
-HVCI / VBS state
-Windows Memory Integrity (code integrity for drivers) state
-DMA Guard / Kernel DMA Protection state
+%LOCALAPPDATA%\Microsoft\Windows\Notifications\wpndatabase.db
 ```
 
-### Weight summary
+Notification history (including Fortnite / Epic launcher notifications).
 
-Each field is hashed into contributions to the backend fingerprint. Weighting (reconstructed from observed behavior — exact weights are Epic's secret):
+### Credential Manager
 
-- **Heaviest:** motherboard UUID, TPM EK, disk serials, permanent MAC, machine GUID
-- **Moderate:** baseboard serial, chassis serial, system product/manufacturer, CPU brand + topology, GPU LUID
-- **Lightest:** monitor EDID, audio endpoints, BIOS vendor/version strings
+```
+%APPDATA%\Microsoft\Credentials\
+%LOCALAPPDATA%\Microsoft\Credentials\
+```
 
-An HWID ban blacklists a combination hash across some subset. The exact combination is Epic's secret. Probability of getting past an HWID ban by changing one field is low; the ban hash is tolerant to single-field drift up to a point.
+Stored credentials (if Epic account credentials cached).
+
+### DPAPI master keys
+
+```
+%APPDATA%\Microsoft\Protect\<SID>\
+```
+
+Keys used to decrypt DPAPI-protected data.
+
+### LSA secrets
+
+```
+HKLM\SECURITY\Policy\Secrets
+```
+
+Requires SYSTEM to read. Contains cached account credentials.
+
+### Scheduled Tasks
+
+```
+C:\Windows\System32\Tasks\
+```
+
+Task scheduler entries (some EAC installers add tasks).
+
+### DriverStore
+
+```
+C:\Windows\System32\DriverStore\FileRepository\
+```
+
+**Every driver INF ever installed** — EAC's driver may have a persistent entry here even after service uninstall.
+
+### Windows Search index
+
+```
+C:\ProgramData\Microsoft\Search\Data\Applications\Windows\Windows.edb
+```
+
+Full-text index of your system, including Fortnite log contents.
+
+### ReadyBoot
+
+```
+C:\Windows\Prefetch\ReadyBoot\
+```
+
+Boot optimization traces — show boot-time EAC service load.
+
+### Setup logs
+
+```
+C:\Windows\inf\setupapi.dev.log
+C:\Windows\inf\setupapi.app.log
+```
+
+Every driver + device install event. Includes EAC driver install.
+
+### Panther logs
+
+```
+C:\Windows\Panther\
+```
+
+Setup/upgrade logs. Record app installs during Windows updates.
+
+### SxS / CBS logs
+
+```
+C:\Windows\Logs\CBS\CBS.log
+```
+
+Component-based servicing — record Windows updates that affected EAC's compatibility.
+
+### Services registry
+
+```
+HKLM\SYSTEM\CurrentControlSet\Services\
+```
+
+Every service ever installed. EAC has its own entries; other historical AC services' entries may also be present.
+
+### Windows.old (if upgrade)
+
+```
+C:\Windows.old\
+```
+
+Prior OS install remnants from an in-place upgrade. Contains all forensic artifacts from before the upgrade.
+
+### Index.dat / WebCache
+
+```
+%LOCALAPPDATA%\Microsoft\Windows\WebCache\
+```
+
+IE legacy but still touched by various Windows components.
+
+### NTFS low-level
+
+```
+$MFT          — Master File Table, every file record including slack entries
+                of deleted files
+$LogFile      — NTFS transaction log of recent filesystem ops
+$INDX records — Directory index entries that survive file deletion
+$Boot         — Volume boot sector (contains volume serial)
+$Secure       — File security metadata
+```
+
+### Quarantine folders (Defender / AV)
+
+```
+C:\ProgramData\Microsoft\Windows Defender\Quarantine\
+```
+
+If Defender quarantined a cheat or EAC component, it's here.
+
+### Game-specific additional traces
+
+```
+Discord logs + install path
+Discord Rich Presence state
+Steam install dir + friend list (if Steam running alongside)
+NVIDIA Shadowplay captures (%USERPROFILE%\Videos\<Game>\)
+OBS/streamlabs configs
+AMD ReLive captures
+Game bar captures (Win+G)
+NVIDIA Container service logs (C:\ProgramData\NVIDIA\NVIDIA Container\*.log)
+GeForce Experience tokens
+```
 
 ---
 
-## A.3 — Comprehensive cleaner operation inventory
+## Part 4 — Epic account identifiers (Fortnite-specific)
+
+Fields that correlate to Epic's server-side records:
+
+| Field | Source |
+|-|-|
+| Epic Account ID (EpicAccountId) | Online auth session |
+| Epic Product User ID (EOS_ProductUserId) | Per-product-sandbox identity |
+| Epic Device ID | `%LOCALAPPDATA%\EpicGamesLauncher\Saved\DeviceIdCache` |
+| Epic launcher install GUID | `HKLM\SOFTWARE\Epic Games\EpicGamesLauncher\AppDataPath` + install-time stamp |
+| OAuth refresh tokens | Encrypted in launcher data |
+| Session access tokens (JWT) | Memory + launcher data |
+| EOS SandboxId (per game) | Per product |
+| EOS DeploymentId | Per product |
+| Linked platform accounts | Steam, Xbox, PSN, Nintendo — linked at account level |
+| Fortnite session continuation tokens | Per-match |
+| Battle Pass state | Per-account |
+| Friend list | Server-side, cached locally per session |
+
+**Account-level HWID binding:** Epic ties specific machine identifiers to the account at signup time + first-time-on-new-hardware moments. Playing from a new HWID on a banned account requires either (a) HWID spoof to match a non-banned HWID, (b) a new account and new hardware altogether.
+
+---
+
+## Part 5 — Comprehensive cleaner operation inventory
 
 The full surface you'd need to touch for a comprehensive clean. This is an **inventory**, not an operational guide. Operational steps are left to the operator. Reinstalling Windows is the "nuclear" option and cleaner than any delete script because it regenerates the Windows identity fields along with the forensic artifacts.
 
@@ -354,10 +502,10 @@ The full surface you'd need to touch for a comprehensive clean. This is an **inv
 |-|-|
 | 1 | Uninstall EAC and Fortnite via Epic launcher (regular path) |
 | 2 | Uninstall system-wide EAC via its uninstaller |
-| 3 | Delete `ProgramData` and `LocalAppData` directories listed in A.1 |
+| 3 | Delete `ProgramData` and `LocalAppData` directories listed in Part 1 |
 | 4 | Delete Epic Games Launcher install directory |
 | 5 | Delete Fortnite's saved data |
-| 6 | Clear registry keys listed in A.1 |
+| 6 | Clear registry keys listed in Part 1 |
 | 7 | Clear prefetch (files, not the directory) |
 | 8 | Clear event logs (requires admin; **creates its own event log entry about the clearing**, which is itself forensically relevant) |
 | 9 | Clear BAM via the SID subkey |
@@ -372,15 +520,28 @@ The full surface you'd need to touch for a comprehensive clean. This is an **inv
 | 18 | Clear Windows Search index: `net stop wsearch` then delete `C:\ProgramData\Microsoft\Search\Data\Applications\Windows\` |
 | 19 | Clear recycle bin |
 | 20 | Clear browser caches and history for any browser used to access Epic accounts |
-| 21 | **Recognize that none of this touches the HWID binding — see A.4** |
+| 21 | Delete ActivityHistory / Timeline SQLite db |
+| 22 | Delete Shellbags registry keys |
+| 23 | Delete UserAssist entries |
+| 24 | Delete TypedPaths / OpenSaveMRU |
+| 25 | Delete WPN notification db |
+| 26 | Delete Credential Manager + DPAPI master key entries |
+| 27 | Delete Panther / CBS / SxS logs |
+| 28 | Clear EAC driver INF from DriverStore |
+| 29 | Clear Windows.old if present |
+| 30 | Clear thumbcache + iconcache |
+| 31 | Clear Fortnite-related NVIDIA Shadowplay / AMD ReLive captures |
+| 32 | Clear Discord / Steam / overlay app logs |
+| 33 | Clear ReadyBoot traces |
+| 34 | **Recognize that none of this touches the HWID binding — see Part 6** |
 
 ---
 
-## A.4 — Why cleaning alone doesn't beat HWID bans
+## Part 6 — Why cleaning alone doesn't beat HWID bans
 
 **The critical point.** EAC's and Epic's backend don't need your on-disk forensic artifacts to re-recognize banned hardware. At next session start:
 
-1. Agent collects the live-queried identifiers in A.2.
+1. Agent collects the live-queried identifiers (see [11 HWID spoofing](11-hwid-spoofing.md)).
 2. Hashes them.
 3. Sends the hash.
 4. Backend compares against the ban list.
@@ -400,8 +561,66 @@ The full surface you'd need to touch for a comprehensive clean. This is an **inv
 
 ### The one operation that does beat an HWID ban on the same hardware
 
-Spoof the inputs that go into the HWID hash. That's [B — HWID spoofing](11-hwid-spoofing.md).
+Spoof the inputs that go into the HWID hash. That's [11 HWID spoofing](11-hwid-spoofing.md).
 
 ---
 
-**Next:** [B — HWID spoofing surface](11-hwid-spoofing.md)
+## Part 7 — Ban status checking
+
+### Specific URLs to check account state
+
+```
+https://www.epicgames.com/account/personal
+```
+
+Shows account-level restrictions. Doesn't show shadow-ban state (shadow bans are specifically designed to be opaque to the user).
+
+Fortnite-specific ban history can be requested via Epic Support but requires identity verification and doesn't disclose shadow bans.
+
+### Shadow-ban detection signals
+
+Signals that correlate (see also [07 Fortnite integrity Part 7](07-fortnite-integrity.md#part-7--kick--soft-ban--hard-ban--hwid-ban-taxonomy)):
+
+- Lobby skill distribution unusually low.
+- Match search time increases 2-5x.
+- Queue populates with accounts with similar "newness" patterns.
+- Fewer human reactions from opponents.
+- Reduced cosmetic diversity.
+
+None definitive. Combined across 10+ matches, strong correlation.
+
+### Ban-type summary table
+
+| Ban type | What you experience |
+|-|-|
+| **Kick** | Disconnected mid-match with an error code. Can rejoin immediately. |
+| **Soft ban** | "You are matchmaking-banned for X time." Timer visible. |
+| **Shadow ban** | Session works normally, but matchmaking is biased. |
+| **Hard ban (account)** | Login fails with "This account has been banned from Fortnite." |
+| **Hard ban (platform)** | Login fails across ALL Epic services. |
+| **HWID ban** | New account created on same hardware is banned within first session. |
+| **IP ban** (rare) | Specific IP range blocked. |
+| **Payment ban** | Account can log in, cannot purchase/receive items. |
+
+---
+
+## Part 8 — Operational cheat-market vernacular
+
+2026-era cheat-market terms for ban states:
+
+| Term | Meaning |
+|-|-|
+| "Flagged" | Server-side correlation data point added. Not yet a ban. |
+| "Rolled" | Ban wave hit — account caught in a scheduled correlation sweep. |
+| "Cooked" | Detected but not yet banned — the pre-ban correlation phase. |
+| "HWID lock" | HWID ban. |
+| "Spooged" | HWID detection tripwire fired, forthcoming ban. |
+| "Dusted" | Account fully banned, hard. |
+| "Chain lock" | Multi-account linked ban — Epic detects account-linked patterns and bans the chain. |
+| "Burned" | Hardware HWID-banned and spoofer no longer helping; need new hardware. |
+
+Useful for interpreting community-forum discussion.
+
+---
+
+**Next:** [11 — HWID spoofing surface](11-hwid-spoofing.md)

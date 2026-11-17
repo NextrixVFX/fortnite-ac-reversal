@@ -1,16 +1,16 @@
-# 07 — Fortnite's own integrity layer
+# 07 — Fortnite integrity layer (Epic's own, independent of EAC)
 
-This is a separate thing people conflate with EAC. The Fortnite shipping exe has anti-cheat logic that runs **independent** of EAC's DLL. Mostly wiring into UE5's anti-cheat module feature system, plus server-authoritative game logic.
+**Separate from EAC.** The Fortnite shipping exe has anti-cheat logic that runs **independent** of EAC's DLL. Mostly wiring into UE5's anti-cheat module feature system, plus server-authoritative game logic, plus Fortnite-specific additions (replay, UEFN sandbox, FNCS tournament controls, cross-play trust, mobile).
 
 Reversing this layer is worth it because:
-
-- Many bans are delivered via Fortnite's own server checks, not EAC's scans.
-- Understanding the client-server trust boundary tells you which "cheats" are visible vs invisible to EAC specifically.
-- The EAC emulation PoC in [13](13-eac-emulation.md) needs to interact with this layer correctly.
+- Many Fortnite bans are delivered via Fortnite's own server checks, not EAC's scans.
+- Understanding the client-server trust boundary tells you which cheats are visible vs invisible to EAC specifically.
+- The [13 EAC emulation PoC](13-eac-emulation.md) needs to interact with this layer correctly.
+- Private-server implementers need to replicate this layer, not just defeat EAC.
 
 ---
 
-## UE5 anti-cheat interface
+## Part 1 — UE5 anti-cheat interface
 
 Unreal has:
 
@@ -32,11 +32,11 @@ Clever design: EAC's reports reach Epic's infrastructure through a channel that 
 
 ---
 
-## Export-ordinal map (EAC_x64 ↔ Shipping)
+## Part 2 — Export-ordinal map (EAC_x64 ↔ Shipping)
 
 The game calls `EasyAntiCheat_x64.dll` **by ordinal, not by name**. Ordinals rotate per EAC build.
 
-Rough shape (names will match the EOS SDK public headers; ordinals are per-build):
+Rough shape (names match the EOS SDK public headers; ordinals are per-build):
 
 | Ord | Name |
 |-|-|
@@ -63,54 +63,150 @@ Plus a bunch more for session events, message signing, trust-state queries.
 
 ---
 
-## Server-authoritative checks (independent of EAC)
+## Part 3 — Server-authoritative movement — specifics
 
-Each of these runs server-side. The client sends intent, the server validates reality. No matter how clean your EAC bypass is, these still catch you if your cheat affects observable game state.
+The movement system is deeply authoritative. Specifics worth knowing:
 
-### Movement authority
+### `UCharacterMovementComponent` + custom Fortnite extensions
 
-- Client sends movement intent (`UCharacterMovementComponent` input vector).
-- Server simulates physics with authoritative inputs.
-- Delta between server-sim and client-reported position checked against tolerance.
-- Over-threshold → net correction (teleport you back) + counter increment.
-- Sustained over-threshold → flag.
+- Base UE class handles movement replication.
+- Fortnite extends with `FortCharacterMovementComponent` (exact class names rotate per build).
+- Additional fields for:
+  - Build mode state.
+  - Edit mode state.
+  - Zipline / glider state.
+  - Launch pad vectors.
+  - Item usage state.
 
-Catches: speed hacks, teleports, infinite jumps, no-clip.
+### Movement validation on server
+
+The server:
+1. Receives client-reported input vector.
+2. Runs authoritative physics simulation with the same input.
+3. Computes expected position.
+4. Compares against client-reported position.
+5. If delta > tolerance → net correction (teleports client to server position).
+6. If delta > severe threshold → flag.
+
+### Specific anti-cheat checks
+
+- **Speed hack detection**: velocity exceeds the player's current movement mode's cap for N ticks.
+- **Teleport detection**: position changes more than physically possible within one tick.
+- **No-clip detection**: player position inside a collision volume server-side.
+- **Infinite-jump detection**: multiple jumps without touching ground.
+- **Launch-pad spam**: player receives more launch-pad boosts than the server-authoritative count.
+- **Zip-line abuse**: player gains velocity while not on a zip-line.
+
+### Why this can't be client-cheated
+
+These are server-side. The cheat client can lie to itself about position, but every network tick the server corrects. Observable "teleport cheats" visible to other players are actually desync artifacts of the server's rejection of the cheater's claimed position.
 
 Reverse via `ACharacter` / `APlayerCharacter` replication + the net-correction logic (`ServerMove` RPCs).
 
+---
+
+## Part 4 — Weapon / combat system integrity
+
 ### Shot-rate validation
 
-- Each weapon has a server-side minimum fire interval.
-- Clients firing faster than that → extra shots discarded, counter incremented.
-- Pattern of excessive overshoots → flag.
+Each weapon has a server-defined `MinFireInterval`. Client firing faster is caught:
+1. Server tracks `LastFireTime` per weapon per player.
+2. New fire event rejected if `NewFireTime - LastFireTime < MinFireInterval`.
+3. Rejected shots counted; sustained rejection pattern → flag.
 
-### Weapon spread validation
+### Spread validation
 
-- Client cannot reduce spread below server config.
-- Server computes **actual** projectile direction using its own spread cone.
-- No-spread cheats get the client to display a tight shot but the projectile goes where the server decided.
+Each weapon has:
+- `BaseSpread` (accuracy cone at rest).
+- `SpreadModifier` based on movement / recoil / aim state.
+
+Server computes **authoritative** spread. Client-side rendered shots may differ from where projectiles actually go. "No-spread cheats" that reduce the client's display of spread don't change the server's bullet trajectory.
+
+### Headshot vs body hit determination
+
+- Server determines hit location via projectile trajectory + bone hitboxes.
+- Client-side hit indicators are cosmetic; damage is server-authoritative.
+- **Aimbot cheats that lock to head position**: still shoot where the server thinks they should hit (based on bullet travel time + target movement prediction). Perfect-locking aimbots sometimes miss because of server-prediction mismatch.
+
+### Fortnite-specific weapon mechanics
+
+- **Weapon rarity caps** — damage bonuses by rarity are server-enforced.
+- **Mythic weapon limits** — can't duplicate mythics via inventory manipulation.
+- **Reload-timing** — server-enforced reload duration.
+
+### Shot spoofing
+
+Client-side cheats that "replay" perfect shot moments don't work because:
+- Each shot is a UFUNCTION RPC to the server.
+- Server rate-limits + sequence-numbers these.
+- Replay attempts produce duplicate or out-of-order RPCs → rejected.
+
+---
+
+## Part 5 — Building / Edit system integrity
+
+Fortnite's unique building mechanic is heavily server-validated:
+
+### Build placement
+
+- Client proposes a build at `(x, y, z, rotation)`.
+- Server:
+  1. Verifies player has required materials.
+  2. Verifies position is not overlapping existing geometry.
+  3. Verifies position is within player's reach distance + line-of-sight.
+  4. Verifies player's inventory supports the build.
+- If any check fails, placement rejected. Client's local build may "snap back" or disappear on reject.
+
+### Build-cheat categories
+
+- **Through-wall builds**: caught by overlap check.
+- **Range-extended builds** (building further than normal): caught by reach distance.
+- **Material-free builds**: caught by inventory check.
+- **Build-anywhere** (ignore collision): caught by overlap.
+
+### Edit-timing cheats
+
+Fortnite's edit system has strict timing. Cheats that pre-emptively edit before the server registers the edit intent:
+- Edit requests must have valid sequence numbers.
+- Server rejects out-of-order edits.
+- Client-side edit previews are not authoritative.
+
+---
+
+## Part 6 — Inventory and item-use integrity
+
+### Item use
+
+- Every item use is a server-authoritative action.
+- Client can't manifest items that aren't in the server's inventory.
+- Picking up an item that's already been picked up by another player → client sees pickup, server rejects, item disappears for the cheater.
+
+### Dupe prevention
+
+- Server-authoritative inventory counts.
+- Drop + pick-up races checked server-side (atomic operations).
+
+### Pet / cosmetic item integrity
+
+- Each cosmetic in inventory must have a backing entitlement.
+- Entitlement checks happen via EOS service (per [13 EAC emulation](13-eac-emulation.md)'s service catalog).
+- **Entitlement-faking** on private servers is the common path for "unlock all skins" feature in Project-Reboot-style private servers.
 
 ### FOV validation
 
-- FOV changers above the slider max → caught server-side.
+- FOV changers above the game's slider limit caught server-side.
 - FOV is replicated for sanity; the server applies its own clamp.
-
-### Build-placement validation
-
-- Illegal placements (through walls, overlapping, through terrain) rejected server-side.
-- Client's local build may show up for a frame, then disappear on reject.
 
 ### Resource delta validation
 
 - Mats and ammo cross-checked.
 - Impossible deltas (gaining mats without a harvest event) → flag.
 
-None of this is EAC. This is Epic's own UE code. You find it in the shipping exe's reflection-tree under paths like `/Game/Athena/Items/…`, `/Script/FortniteGame`.
+None of this is EAC. This is Epic's own UE code.
 
 ---
 
-## Kick / soft-ban / hard-ban / HWID-ban taxonomy
+## Part 7 — Kick / soft-ban / hard-ban / HWID-ban taxonomy
 
 Fortnite's enforcement tiers, from lightest to heaviest:
 
@@ -118,11 +214,18 @@ Fortnite's enforcement tiers, from lightest to heaviest:
 |-|-|-|
 | **Kick** | Session-only. No account consequence. | Typically client-side by EAC when the detection is immediate and unambiguous (overlay opened, kernel debugger attached). |
 | **Soft ban** | Cooldown after match loss (minutes to hours). | Server heuristics. |
-| **Shadow ban** | Matchmaking into a queue of flagged accounts. No notification. | Server correlation. **Epic's cleverest mechanism** — took the cheat community a long time to figure out it existed. |
-| **Hard ban** | Account termination. | Server correlation across multiple sessions. |
+| **Shadow ban** | Matchmaking into a queue of flagged accounts. **No notification.** | Server correlation. **Epic's cleverest mechanism** — took the cheat community a long time to figure out it existed. |
+| **Hard ban (account)** | Account termination. | Server correlation across multiple sessions. |
+| **Hard ban (platform)** | Login fails across ALL Epic services. | Severe or repeat offenders. |
 | **HWID ban** | Hard ban plus hardware fingerprint block. | Repeat offender appears with a fresh account on same hardware. |
+| **IP ban** (rare) | Specific IP range blocked. | Egregious cases. |
+| **Payment ban** | Account can log in, cannot purchase/receive items. | Chargeback / fraud. |
+| **V-Bucks hold** | V-Bucks frozen pending review. | Anti-fraud. |
+| **Competitive ban** | Can play unranked, can't enter arena / FNCS. | Competitive-specific violations. |
+| **Chat ban** | Can play, chat disabled. | Behavior violations. |
+| **Transaction ban** | Can play, can't buy items. | Fraud/charge-back. |
 
-### Shadow ban mechanics
+### Shadow ban mechanics (specifically interesting)
 
 Specifically interesting because it's invisible. A shadow-banned account:
 
@@ -133,30 +236,443 @@ Specifically interesting because it's invisible. A shadow-banned account:
 
 Server-side only. Nothing on the client distinguishes a shadow-matched session from a normal one.
 
+### Signals that correlate to shadow ban
+
+Players often suspect shadow ban but can't confirm. Specific signals:
+- **Lobby skill distribution is unusually low** (bots or similarly-flagged accounts).
+- **Match search time increases by 2-5x** average.
+- **Queue populates with accounts with similar "newness" patterns** (same creation window as yours).
+- **Fewer human reactions** — opponents who move but don't "look like" they're reacting to your actions.
+- **Reduced cosmetic diversity** — flagged-account lobbies have fewer rare items on display.
+
+None are definitive. Combined across 10+ matches, strong correlation.
+
 ### HWID ban binding
 
-Covered in depth in [10 — cleaner & ban traces](10-cleaner-ban-traces.md), but the short version: the backend stores a hash over some combination of HWID fields (SMBIOS UUID, motherboard serial, disk serial, TPM EK hash, MAC prefix, machine GUID, …). On session start, agent collects, hashes, sends. Backend matches against ban list.
+Covered in depth in [10 cleaner & ban traces](10-cleaner-ban-traces.md), but the short version: the backend stores a hash over some combination of HWID fields (SMBIOS UUID, motherboard serial, disk serial, TPM EK hash, MAC prefix, machine GUID, …). On session start, agent collects, hashes, sends. Backend matches against ban list.
 
-**Cleaning disk artifacts does not undo HWID bans.** HWID bans are hardware-rooted; the mitigation is spoofing (per [11](11-hwid-spoofing.md)) or new hardware.
+**Cleaning disk artifacts does not undo HWID bans.** HWID bans are hardware-rooted; the mitigation is spoofing (per [11 HWID spoofing](11-hwid-spoofing.md)) or new hardware.
 
 ---
 
-## What's visible to EAC vs Fortnite's own checks
+## Part 8 — Fortnite modes — EAC coverage differences
 
-Useful mental model for understanding where a given cheat gets caught:
+Different Fortnite modes have different EAC integration depth:
 
-| Cheat type | Caught by | How |
+| Mode | EAC coverage | Notes |
 |-|-|-|
-| DLL injected into game | EAC agent | VAD scan, module scan, handle-open log |
-| Kernel driver cheat | EAC driver | Driver list, callback dump, BYOVD matching |
-| External memory reader (no injection) | EAC + behavior | Handle strip prevents reads; behavior caught by server checks |
-| DMA cheat (external hardware) | Server checks only | EAC can't see it; input ML + behavioral correlation |
-| Hypervisor-based cheat | EAC anti-VM | CPUID timing, APIC topology, hypervisor brand |
-| Macros / recoil scripts | Server + input ML | Distributional analysis of mouse input |
-| FOV changers | Server | Server clamps FOV |
-| Server-side bot setup (second PC + capture card) | Server input ML only | Input anomaly + outlier win-rate correlation |
+| **Battle Royale** | Full — driver + agent + Fortnite-side integrity | Primary detection mode |
+| **Zero Build** | Full | Same as BR |
+| **Save The World (STW, campaign)** | Partial | Lighter kernel integration historically; current builds match BR |
+| **Creative / UEFN maps** | Partial | Server-side authoritative checks less stringent for private creative sessions |
+| **Rocket Racing** | Full | Own EOS product_id but same base stack |
+| **Fortnite Festival** | Full | Own EOS product_id |
+| **LEGO Fortnite** | Full | Own EOS product_id |
 
-The pattern: EAC catches **client-process anomalies**. Fortnite catches **game-state anomalies**. External cheats evade EAC but can't evade game-state checks because the cheat has to affect game state to be useful.
+Historical gap: STW's lighter integration was exploited for farming / duplication cheats pre-2021. Closed by Epic post-2022.
+
+### Save The World (STW) specifics
+
+STW is Fortnite's PvE mode, currently in maintenance.
+
+Differences from Battle Royale:
+- **PvE-focused** — less direct cheat impact.
+- **Historical dupe exploits** — STW's inventory system has had multiple dupe exploits historically (2018-2021). Patched.
+- **Trading economy** — STW has an in-game trading economy that historically was exploited. Trading restricted in current builds.
+- **V-Bucks farming** — STW grants V-Bucks over time. Automated farming is detected.
+
+Uses the same EAC stack as BR. Server-side validation on inventory + currency grants.
+
+### Rocket Racing / Festival / LEGO inside Fortnite
+
+Each has its own:
+- EOS `product_id` + `deployment_id`.
+- Same base EAC stack.
+- Different server-authoritative checks.
+- Different anti-cheat priorities (e.g., Festival's rhythm-game anti-cheat is very different from BR).
+
+**Shared EAC installation**: one `EasyAntiCheat_EOS` service protects all these sub-modes.
+
+---
+
+## Part 9 — Replay system integrity
+
+Fortnite has a replay system — full match recording that plays back with free camera.
+
+### Why replay integrity matters
+
+- Competitive tournaments use replay reviews.
+- Cheater reports include replay footage.
+- Clip-sharing for social features.
+- Spectator mode for esports.
+
+### How replays are protected
+
+- Replays are signed by the server with session-attestation keys.
+- Modified replays fail signature verification.
+- Replay playback runs under a restricted process mode (no network, limited input).
+
+### Replay-specific cheats
+
+Rare because replays are server-generated, but exist:
+- Modified-client replay recording (saves locally with client-side cheats visible).
+- Replay-share exploits (faking the sharer's identity).
+
+Minor concern vs match-level cheats.
+
+---
+
+## Part 10 — UEFN (Unreal Editor for Fortnite) integrity
+
+Fortnite Creative 2.0 → UEFN launched 2023. Players can author their own Fortnite maps with custom code (Verse language).
+
+### Verse sandbox
+
+Verse is a **sandboxed** language:
+- No memory access primitives.
+- No file I/O.
+- No network outside the game's RPC system.
+- No OS integration.
+
+### Why the sandbox matters
+
+- UEFN maps are user-authored and shared publicly.
+- Malicious UEFN maps could be vectors for cheats or attacks.
+- The Verse sandbox prevents UEFN maps from compromising the game.
+
+### Current research
+
+- Multiple researchers have probed the Verse sandbox since launch.
+- No publicly-disclosed sandbox escape as of 2026.
+- Private: unclear — if a sandbox escape exists privately, it's extraordinarily valuable.
+
+### UEFN map integrity
+
+- UEFN maps are deployed as server-side packages.
+- When played, the client downloads the map via the Fortnite CDN.
+- Maps are signed by Epic (not the creator) before distribution.
+- Map modifications fail signature verification.
+
+---
+
+## Part 11 — Account trust signals
+
+Fortnite's matchmaking factors account trust beyond just HWID:
+
+### Signals
+
+- **Account age** — older accounts trusted more.
+- **Email verification state** — verified emails trusted.
+- **2FA enabled** — 2FA-enabled accounts trusted.
+- **Payment history** — accounts with real payments trusted (fraud-resistant accounts).
+- **Play history** — long play history trusted.
+- **Report history** — multiple reports against an account reduce trust.
+- **Connected platforms** — linked Xbox/PlayStation/Switch accounts add trust (consoles are harder to spoof).
+- **Device history** — list of trusted devices (see Part 16 below).
+
+### How trust affects matchmaking
+
+- Low-trust accounts get matched with other low-trust accounts (soft shadow-banning effect).
+- High-trust accounts get prioritized matchmaking.
+- Brand-new accounts have temporary "new player protection" (easier opponents for first N matches).
+
+### How trust affects ban correlation
+
+- Low-trust account flagged for suspicious behavior → banned faster.
+- High-trust account flagged → more correlation data gathered before ban.
+- Trust doesn't absolve — bans happen regardless, just at different cadences.
+
+---
+
+## Part 12 — Competitive integrity — tournaments / FNCS
+
+Fortnite Champion Series (FNCS) and other competitive events have additional anti-cheat:
+
+### Tournament-specific additions
+
+- **Hardware verification**: participants in top-tier events may be required to use pre-approved hardware configurations.
+- **Observer mode monitoring**: tournament observers watch for behavioral anomalies in real-time.
+- **Replay review**: all competitive matches reviewed after the fact for suspect play.
+- **Spectator restriction**: tournaments have specific spectator modes with limited information.
+
+### Face-cam requirements
+
+For top-level events (FNCS Grand Finals), players may be required to:
+- Stream face-cam (visible to Epic officials).
+- Use webcam feed as additional attestation that a real human is at the keyboard.
+- Not technical anti-cheat but social/compliance.
+
+### Payout holds
+
+Prize money for FNCS placements is held for weeks after the event. If subsequent investigation reveals cheating, payout is revoked. This gives Epic an additional detection window.
+
+---
+
+## Part 13 — Cross-play and console trust
+
+Fortnite is cross-platform. Different platforms have different trust properties:
+
+### Platform trust ranking (roughly)
+
+1. **Switch / Xbox / PlayStation** — highest trust. Consoles are locked-down OSes with mandatory signing. Cheats possible but extremely rare (hardware mod required).
+2. **Mobile (Android / iOS)** — moderate trust. Android has root exploits; iOS is harder.
+3. **PC (Windows)** — **lowest** trust. Open OS, kernel accessible.
+
+### Cross-play implications
+
+- Console-only lobbies are safer from cheats.
+- PC players can opt out of cross-play lobbies in some modes.
+- Cross-play matches apply PC-level scrutiny to all players in the lobby.
+
+### Platform-specific anti-cheat
+
+| Platform | AC |
+|-|-|
+| Xbox | Microsoft's console security + Fortnite server-side |
+| PlayStation | Sony's console security + Fortnite server-side |
+| Switch | Nintendo's console security + Fortnite server-side |
+| Android | Google Play Integrity API + Epic game-side |
+| iOS | Apple's app signing + Epic game-side |
+| PC | **Full EAC stack** + Fortnite game-side |
+
+Consoles don't run EAC. They don't need to — their OS is the attestation.
+
+---
+
+## Part 14 — Mobile Fortnite status
+
+- **Android**: available via Epic Games Store (not Google Play since 2020 lawsuit).
+- **iOS**: unavailable in US as of 2026 (Apple vs Epic ongoing); available in EU via sideloading.
+- Mobile Fortnite has lighter server-authoritative checks (adapted for mobile performance).
+
+### Mobile anti-cheat specifics
+
+Fortnite mobile uses different techniques:
+
+**Android:**
+- **Google Play Integrity API** check (if installed via Play Store, which it isn't since 2020).
+- **Epic's own attestation** via Fortnite app.
+- **SafetyNet** fallback.
+- Root detection via `su` binary enumeration.
+- Magisk hiding is detected via structural tests.
+- Modified APK detection (signature verification).
+
+**iOS:**
+- **App signing** by Apple.
+- Jailbreak detection via file system / library existence checks.
+- EOS SDK's own attestation.
+- iOS 17+'s runtime integrity enforcement.
+
+### Mobile vs PC
+
+**Fortnite mobile does not run EAC.** The anti-cheat on mobile is entirely:
+- Platform-level app signing.
+- Epic's game-side attestation.
+- Server-side authoritative checks.
+
+No kernel driver exists on mobile. The EAC stack is PC-specific.
+
+Cheats on Android: root-based memory editors exist. iOS: jailbreak-dependent, rare.
+
+---
+
+## Part 15 — Fortnite's cosmetic verification
+
+Specific to Fortnite: every cosmetic a player owns is server-verified.
+
+### Cosmetic entitlements
+
+Each cosmetic the player owns is an **entitlement** tracked server-side:
+- Granted via purchase, Battle Pass, or event reward.
+- Each entitlement has an ID + grant timestamp + source.
+- Entitlement DB is centralized at Epic.
+
+### Cosmetic-cheat prevention
+
+- Clients can't locally spoof cosmetics they don't own.
+- Server sends authoritative entitlement list at match start.
+- Client-side modification of cosmetic display is purely cosmetic for the cheater — other players see what the server says.
+
+### Private-server-only cosmetic unlocks
+
+Per [13 EAC emulation](13-eac-emulation.md): private servers often implement "grant all cosmetics" as a feature. Doesn't affect Epic's servers — the private server just returns "player owns everything" from the entitlement service mock.
+
+---
+
+## Part 16 — Fortnite's own HWID/account binding (separate from EAC's)
+
+- **Fortnite stores a per-account "trusted devices" list** — devices that have logged in to the account.
+- **New device = email verification required** (if account has 2FA).
+- **"New hardware" detection** happens at launch on the Epic launcher side, not inside Fortnite/EAC.
+- **Shared with Epic Games Store** for account-protection — the same "new device" check fires for store access.
+
+So an HWID spoofer that beats EAC's HWID fingerprint may still trigger the launcher's new-device check. For a complete setup, the spoofer needs to also keep the Epic launcher's device cache stable.
+
+Files involved:
+- `%LOCALAPPDATA%\EpicGamesLauncher\Saved\DeviceIdCache*`
+- `%LOCALAPPDATA%\EpicGamesLauncher\Saved\Config\Windows\GameUserSettings.ini`
+
+---
+
+## Part 17 — Match-level fraud detection
+
+Beyond cheats, Epic also detects match-level fraud.
+
+### Win-trading detection
+
+- Pattern: two players repeatedly match against each other, one always wins.
+- Server-side detection via pairing-frequency analysis.
+- Enforcement: both players banned or soft-banned.
+
+### Account-sharing / smurfing
+
+- Pattern: account played at different skill levels at different times.
+- Detection via playstyle fingerprinting (mouse movement + reaction time signatures).
+- Enforcement: soft action usually (matchmaking skill-bracket adjustment).
+
+### Carry fraud
+
+- Pattern: paid service where a high-skill player plays on a low-skill account.
+- Detected via shared-device patterns + account access logs.
+- Enforcement: paid-carry services get explicit violations under TOS.
+
+### Boosting
+
+- Pattern: high-skill player boosts low-skill account into higher brackets.
+- Detected via skill-rating velocity.
+- Enforcement: skill-rating resets.
+
+---
+
+## Part 18 — Fortnite endpoint URLs (for private-server implementation)
+
+Beyond [04 user-mode agent](04-user-mode-agent.md), Fortnite-specific endpoints:
+
+```
+https://account-public-service-prod.ol.epicgames.com
+https://account-public-service-prod03.ol.epicgames.com
+https://fortnite-public-service-prod11.ol.epicgames.com
+https://fortnitepublic-service-prod12.ol.epicgames.com
+https://friends-public-service-prod.ol.epicgames.com
+https://party-service-prod.ol.epicgames.com
+https://presence-public-service-prod.ol.epicgames.com
+https://lightswitch-public-service-prod06.ol.epicgames.com
+https://catalog-public-service-prod06.ol.epicgames.com
+https://matchmaking-public-service-prod.ol.epicgames.com
+https://entitlement-public-service-prod08.ol.epicgames.com
+https://xmpp-service-prod.ol.epicgames.com
+https://datarouter.ol.epicgames.com
+https://api.epicgames.dev
+https://modules-cdn.eac-prod.on.epicgames.com
+https://ut-public-service-prod10.ol.epicgames.com
+```
+
+For a private-server implementation (see [13 EAC emulation](13-eac-emulation.md)), each of these needs a mock implementation.
+
+---
+
+## Part 19 — Specific Fortnite subprocess architecture
+
+When Fortnite runs, multiple processes exist:
+
+### Main processes
+
+- `FortniteLauncher.exe` — pre-launcher
+- `FortniteClient-Win64-Shipping_EAC.exe` — EAC wrapper
+- `FortniteClient-Win64-Shipping.exe` — actual game client
+- `EasyAntiCheat_EOS.exe` — EAC service
+
+### Child processes
+
+- `CrashReportClient.exe` — crash handler (loads if game crashes)
+- `EpicWebHelper.exe` — web overlay / login UI
+- `EosOverlayRenderer-Win64-Shipping.exe` — EOS social overlay
+
+### Each process has security implications
+
+- Crash reports: contain minidumps that could include cheat DLLs in memory.
+- Web helper: loads CEF (Chromium Embedded Framework); has its own attack surface.
+- EOS overlay: renders UI over the game; targeted by overlay cheats.
+
+### Inter-process communication
+
+- Game ↔ EAC: named pipe (per [05 pipe protocol](05-pipe-protocol.md)).
+- Game ↔ Launcher: command-line args + session tokens.
+- Game ↔ EOS overlay: shared memory + named events.
+- Game ↔ CrashReportClient: file-based (dumps written to disk, CRC reads them).
+
+---
+
+## Part 20 — Fortnite history vs anti-cheat
+
+| Period | Anti-cheat |
+|-|-|
+| 2017 (launch — early BR) | **BattlEye** |
+| 2017-2018 | BattlEye + EAC experiments |
+| 2018-2021 | **BattlEye + EAC dual stack** |
+| 2021 onwards | **EAC only** (Epic consolidated post-acquisition of EAC in 2018) |
+| 2022+ | EAC migrating from Classic to EOS variant |
+| 2023+ | Current EAC-EOS with Ed25519 signing, ETW-TI, TPM attestation |
+
+The dual-stack period was unusual — both anti-cheats ran simultaneously. Each caught different cheat categories; cheat developers had to defeat both. The 2021 switch to EAC-only was Epic's consolidation move after owning both the game and the anti-cheat.
+
+**Fortnite private-server emulators specifically target the pre-2021 dual-stack configurations or earlier where defeat conditions are different.**
+
+---
+
+## Part 21 — Fortnite competitive eras + cheat waves
+
+Specific events that triggered observable EAC changes:
+
+### The 2019 "Fortnite Winter Cheat Wave"
+
+- Massive hypervisor cheat deployment during the holiday season.
+- Epic's response: emergency patch adding anti-VM timing checks in mid-December.
+- Set the precedent for "major cheat events trigger mid-season EAC updates."
+
+### The 2020 "World Cup qualifier scandal"
+
+- Multiple accused cheaters in FNCS qualifiers.
+- Epic rolled back prize distributions.
+- Established the payout-hold policy still in use.
+
+### The 2021 "RTCore64.sys crackdown"
+
+- Microsoft added RTCore64 to WDAC block list.
+- Many Fortnite cheats relied on it.
+- Precipitated the move toward manual-mapped drivers + hypervisor cheats.
+
+### The 2023 "BlackLotus era"
+
+- First publicly-disclosed UEFI bootkit bypass of Secure Boot.
+- Elite Fortnite cheat vendors adopted bootkit persistence.
+- EAC response: TPM attestation + Measured Boot PCR drift detection.
+
+### The 2024 "Project Reboot DMCA wave"
+
+- Epic went after Project Reboot derivatives aggressively.
+- Multiple repos taken down.
+- Private-server operators moved to pseudonymous hosting.
+
+### The 2025 "DMA proliferation"
+
+- Chinese FPGA DMA cards became $200 commodity.
+- Fortnite ban wave specifically targeting DMA players.
+- EAC added PCI configuration space enumeration + IOMMU state reporting.
+
+---
+
+## Part 22 — What Fortnite-specific additions tell us about Epic's threat model
+
+Patterns across all the above:
+
+1. **Server-authoritative everything** where latency allows.
+2. **Trust graduation** — new players get easier ride, established players get more scrutiny of behavior.
+3. **Correlation over time** — single-session catches are rare; cross-session correlation is the primary.
+4. **Economic pressure on cheat market** — FNCS payouts held, so top-level cheaters get hurt financially in addition to banned.
+5. **Platform differentiation** — PC is lowest trust; consoles get easier rides; mobile sits in between.
+
+For private-server implementers: **the game-side integrity layer is often harder to replicate than EAC itself.** You can bypass EAC with patches. You can't easily replicate the entire server-authoritative game-logic framework Epic built — that's where private servers remain imperfect even when EAC is defeated.
 
 ---
 
