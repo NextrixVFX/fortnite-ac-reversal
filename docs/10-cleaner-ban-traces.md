@@ -537,6 +537,47 @@ The full surface you'd need to touch for a comprehensive clean. This is an **inv
 
 ---
 
+## Part 5.5 — Community observations on cleaning effectiveness (Nov 2026)
+
+Direct observations from active Fortnite HWID-ban debugging (UC thread 779558 — AleaClient/ReTrac, generalizable):
+
+### CatCaller's "only registry" claim (contested)
+
+CatCaller (average-trust): *"The only 'traces' are in registry they do not leave any other. And yes, I have confirmed it just yesterday."*
+
+**Followed by:** *"MAC, SMBIOS and Volume ID is also not needed."* (for unban)
+
+### Counter from SOHELDAGOAT
+
+*"doubt it he is wrong anyways like u need to spoof another identifier to get unbanned its not enough what he said."*
+
+### Interpretation
+
+The split suggests:
+- **Registry-based trace** is a meaningful component — potentially the primary surface for session-level ban enforcement.
+- **But not sufficient alone** — the HWID hash includes identifiers beyond MAC/SMBIOS/VolumeID, and spoofing only the obvious ones leaves gaps.
+
+### Averser's "reinstall Windows" position
+
+Averser (UC thread 781505): *"Cleanall diskpart. Reinstall win. Reinstalling Windows is enough to clean everything. because each update leaves a lot of new traces. cleaning software can barely keep up. so to avoid falling into an endless ban loop, the quickest solution to diagnose is to reinstall Windows and spoof."*
+
+### Operational takeaway
+
+If you have a cleaner that doesn't track **every** Windows-Update-generated trace point, you'll miss newly-created artifacts. Reinstalling Windows resets all of them at once. **Reinstall-and-spoof is the standard community approach for HWID-lite bans (24h to 365day).**
+
+For permanent HWID bans: new hardware required, cleaning doesn't help.
+
+### Short-duration HWID bans exist
+
+Not all HWID bans are permanent. Observed durations in UC community:
+- **24-hour HWID bans** — kaiquemarianoah (thread 781505): "banned for 24h after 1 year."
+- **365-day HWID bans** — saseeexfg (thread 781256): "I recently got hwid banned on fortnite for 365 days."
+- **Permanent HWID bans** — the classic.
+
+Epic's enforcement tiers include time-limited HWID restrictions — not just binary banned/not-banned.
+
+---
+
 ## Part 6 — Why cleaning alone doesn't beat HWID bans
 
 **The critical point.** EAC's and Epic's backend don't need your on-disk forensic artifacts to re-recognize banned hardware. At next session start:

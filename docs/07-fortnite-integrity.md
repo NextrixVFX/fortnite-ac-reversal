@@ -571,6 +571,57 @@ For a private-server implementation (see [13 EAC emulation](13-eac-emulation.md)
 
 ---
 
+## Part 18.5 — Fortnite's page-encryption anti-dump mechanism
+
+Beyond EAC's protections, **Fortnite itself implements in-process page encryption** to resist dumping of the shipping EXE. Documented by notaskid65 on UC (thread 772331).
+
+### How it works
+
+1. Fortnite sets protected `.text` pages to **`PAGE_NOACCESS`**.
+2. Hooks `KiUserExceptionDispatcher` using a trampoline.
+3. When any code tries to access a protected page → access violation → exception dispatched → EAC's trampoline runs.
+4. The trampoline checks whether the exception falls within a legitimate region.
+5. If legit → decrypts the page on the fly and lets execution continue.
+6. If not legit → fails hard.
+
+### The 500-page decryption limit
+
+**There's a hard cap of 500 page decryptions per session.** Beyond this limit, further page accesses fail even from legitimate code paths. Epic's design keeps most of the exe permanently encrypted; only the actively-executing code paths get decrypted.
+
+### Dumping strategy
+
+Per notaskid65:
+
+1. **Scan while playing** — trigger page decryption through normal gameplay (menus, matches, different modes).
+2. **Inject a module to force access** — a well-placed read can decrypt specific pages.
+3. **Find gadgets scattered through accessible pages** — look for `mov reg, [qword]` instructions pointing at protected ranges and force those to trigger access.
+
+Playing + mode-changing through the limit gives you approximately 40k/118k pages decrypted per session, per Lauv's testing.
+
+### Comparison
+
+This mechanism is **architecturally similar to Byfron's usermode AC** (Roblox) per community observation (manhcot123, UC thread 772331).
+
+Fortnite uses this on top of EAC, not instead of — layered defense.
+
+---
+
+## Part 18.6 — Mid-game ban behavior (observed)
+
+Per ecco271k (UC thread 779558 — AleaClient / ReTrac observations, applicable to Fortnite stock):
+
+**When you get banned mid-game:**
+- The game **stops sending packets** from the server to the client.
+- All other players appear frozen client-side.
+- You can't move / interact.
+- On next launch attempt → **infinite matchmaking queue**.
+
+**Diagnostic signal** that you've been HWID-banned on a session you thought was clean: packet freeze + inf-queue pattern.
+
+**Report-based ban enforcement is active** — per CyberTrail (same thread): "if a few people report you I think they just ban off that." The report threshold isn't published, but repeated reports in a short window will trigger review.
+
+---
+
 ## Part 19 — Specific Fortnite subprocess architecture
 
 When Fortnite runs, multiple processes exist:

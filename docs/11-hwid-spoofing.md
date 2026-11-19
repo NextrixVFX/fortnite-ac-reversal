@@ -160,6 +160,7 @@ Accessed via `NtQuerySystemInformation(SystemFirmwareTableInformation, 'RSMB')`,
 | GPU adapter LUID | `IDXGIAdapter::GetDesc1` |
 | GPU device description | Same |
 | GPU vendor/device/subsystem/revision | PCI config space + `HKLM\SYSTEM\CurrentControlSet\Enum\PCI\VEN_*\DEV_*` |
+| **GPU vBIOS version** | **NVAPI / `NvAPI_GPU_GetVbiosVersionString`** (confirmed collected by EAC — lukiuz0x thread 778933) |
 | GPU VRAM size | Dedicated/shared video memory |
 | WDDM version | `DXGI_GPU_PREFERENCE` |
 | D3D feature level | Highest supported FL |
@@ -208,6 +209,9 @@ Accessed via `NtQuerySystemInformation(SystemFirmwareTableInformation, 'RSMB')`,
 | **Secure Boot DB / DBX / KEK / PK hashes** | UEFI vars, TPM-measured |
 | Boot Configuration Data (BCD) GUIDs | `HKLM\BCD00000000` mount (or disk BCD file) |
 | BootCurrent / BootNext / BootOrder | UEFI vars |
+| **Boot GUID** | **EFI var — collected by EAC per lukiuz0x thread 778933** |
+| **Boot ID** | **EFI var — collected by EAC per lukiuz0x thread 778933** |
+| **Partition GUIDs** | **GPT — collected (alexanderyy thread 778933)** |
 | HVCI state | `HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\HypervisorEnforcedCodeIntegrity` |
 | VBS state | `HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\EnableVirtualizationBasedSecurity` |
 | DMA Protection (Kernel DMA) | Policy registry + ACPI DMAR table |
@@ -336,11 +340,23 @@ A spoofer that wants to change what EAC sees has to patch **all three paths**. T
 
 Section `0x71` (firmware version block list) blocks known fake BIOS versions.
 
-### 2.2 — Disk serials
+### 2.2 — Disk serials — **direct cache-bypassing IOCTLs**
+
+**Important detail from alexanderyy (thread 778933):**
+
+> disks (with direct ioctl's that don't use cache too)
+
+EAC uses **direct IOCTLs that bypass the Windows storage cache** when reading disk identifiers. Significance:
+
+- Common disk-serial spoofers rely on caching: respond once with the fake value, let it get cached, Windows serves the cached response to subsequent queries.
+- **EAC defeats this by issuing cache-bypassing IOCTLs.** Every query goes to the storage stack for a fresh read. The spoofer's one-time response gets overwritten by the real disk's response on EAC's next read.
+- To beat this, the spoofer has to intercept **every single read**, not just the cached first one. Storage-stack filter driver that intercepts **all** IOCTLs in both directions.
 
 **Physical disk serial** via `IOCTL_STORAGE_QUERY_PROPERTY`:
 
 The IOCTL is handled by `\Driver\disk` → `\Driver\storport` → the SCSI/NVMe miniport. A spoofer either hooks `disk.sys`'s dispatcher (more PatchGuard-flaggable) or — more durably — registers a filter driver above `disk.sys`.
+
+**Must filter every IOCTL, not just the first cached one.** Lazy spoofers that trust Windows's caching lose this battle.
 
 **NVMe-specific identifiers** via `IOCTL_STORAGE_PROTOCOL_COMMAND`:
 - NVMe `identify-controller` returns `EUI64` (8 bytes) and `NGUID` (16 bytes).
@@ -355,17 +371,38 @@ The IOCTL is handled by `\Driver\disk` → `\Driver\storport` → the SCSI/NVMe 
 2. Filter driver above `disk.sys` is the clean approach.
 3. Current-build EAC compares disk serial via both the user-mode IOCTL path and a WMI query. A spoofer that only hooks one shows drift.
 
-### 2.3 — MAC addresses
+### 2.3 — MAC addresses — **FOUR collection paths (critical update)**
 
-**Current MAC vs permanent MAC** — EAC reads the PERMANENT MAC via `OID_802_3_PERMANENT_ADDRESS`, not current. Registry-level MAC changer tools do nothing against EAC fingerprinting.
+Per **alexanderyy** (UC legend, trust 78 — thread 778933):
 
-**Spoofing permanent MAC:**
+> Permanent MAC is collected 4 different places, common ndis way, then own entry from arp table, ExAllocateUUID and PCIE Config Space DSN (unspoofable without hypervisor)
 
-1. **Filter driver above the specific miniport.** Rewrites responses to `OID_802_3_PERMANENT_ADDRESS`. Cleanest.
-2. **Hook the NDIS IM (intermediate module) layer.** Rewrite responses before they bubble up.
-3. **Some NICs have EEPROM update tools** that change the burned-in MAC. Nontrivial, requires per-vendor firmware tools.
+Four collection paths EAC uses for permanent-MAC fingerprinting:
 
-**MAC prefix hazard:** If your fake permanent MAC uses a prefix that doesn't match any registered OUI, EAC flags. The anomaly list blocks known fake prefixes. A spoofer generates MACs with real-OUI prefixes.
+| # | Path | Spoofable via |
+|-|-|-|
+| 1 | **`OID_802_3_PERMANENT_ADDRESS` via NDIS** | NDIS filter driver (standard approach) |
+| 2 | **ARP table own-entry** | Hook ARP table API or filter at NDIS |
+| 3 | **`ExAllocateUUID`** — embeds MAC into generated UUIDs | Must patch ExAllocateUUID output or hook it |
+| 4 | **PCIe Config Space DSN** (Device Serial Number capability) | **UNSPOOFABLE without hypervisor** |
+
+#### The PCIe Config Space DSN path — the hardest one
+
+The PCIe Device Serial Number is an extended capability (`capability ID 0x03`) on PCIe devices that includes the EUI-64, which embeds the device's MAC for NICs. Reading via PCI config space (`setupapi` → `IoGetDeviceProperty` → read config space directly from the HAL).
+
+**Why it's unspoofable without a hypervisor:** Reads go directly to the PCIe root complex / IOMMU translation. There's no kernel-callable hook point between the config-read instruction and the hardware response. A hypervisor can intercept PCIe config-space reads at the VM-exit level; a kernel driver cannot.
+
+#### Operational implication
+
+A spoofer that only hooks the NDIS path leaves three other collection paths exposed. **A complete MAC spoofer requires:**
+1. NDIS filter for path 1.
+2. ARP-table interception for path 2.
+3. `ExAllocateUUID` hook for path 3.
+4. **Hypervisor for path 4** — or accept the PCIe DSN contribution to your HWID hash and hope the backend tolerates drift.
+
+Most commercial HWID spoofers only hit path 1 (and maybe 2). This is why "I spoofed my MAC but still get HWID banned" is a common experience — the other three paths still reveal the real MAC.
+
+**MAC prefix hazard still applies:** If your fake permanent MAC uses a prefix not matching any registered OUI, EAC flags. The anomaly list blocks known fake prefixes. A spoofer generates MACs with real-OUI prefixes. And now all 4 paths need to agree on the fake value.
 
 ### 2.4 — CPU identifiers
 
@@ -403,6 +440,34 @@ Stored in registry: `HKLM\SYSTEM\CurrentControlSet\Enum\DISPLAY\*\*\Device Param
 ### 2.7 — TPM endorsement key
 
 Current-build EAC queries TPM EK via TBS (TPM Base Services) APIs. EK public is the strongest-stable hardware identifier.
+
+#### Nuance per alexanderyy (UC thread 778933)
+
+> TPM is collected but i don't think it is used.
+
+alexanderyy's observation of Fortnite EAC: TPM EK values **are collected** but may **not be used in the ban-hash itself**. The collection might be for separate behavioral correlation or future-use, not current HWID-ban binding.
+
+This is uncertain. Treat as: **collect TPM anyway**, assume it matters, but recognize that current-build enforcement may primarily use SMBIOS + disk serials + MAC + machine GUID rather than TPM EK.
+
+#### How EAC actually validates TPM attestation (per flow1777, thread 781177)
+
+> EAC go through tbs.sys directly or do remote attestation where the tpm signs a nonce with the fused EK and ms/vendor pki validates it server side, your hook never touches that signed material.
+
+Two paths:
+1. **Direct `tbs.sys` calls** — EAC's driver calls `TbsiSubmitCommand`, `TbsiGetDeviceInfo`, etc. Returns include the EK public portion.
+2. **Remote attestation** — TPM signs a nonce with the fused EK, result sent to Epic's backend, MS/vendor PKI validates server-side. **Hooks don't touch this** — the signed material is produced inside the TPM.
+
+#### Sanity check tool
+
+**`tpmtool getdeviceinformation`** — reads TPM EK via the same path EAC uses. If a spoofer is working at the TBS level, this command shows the spoofed EK. If it shows the real EK after your spoofer is loaded, your hook isn't hitting EAC's actual read path.
+
+#### Reference projects
+
+Mentioned in thread 781177:
+- **hitome55's "Bypassing TPM/Secureboot" thread** on UC anti-cheat-research.
+- **qwnd1's pulzar-hypervisor base** — kernel/bare-metal TPM emulation starting point. qwnd1 is a UC legend who notes: *swtpm is horrible for this use case (usermode-only). Bare-metal TPM emulation needs a TPM worker thread because crypto operations are slow and synchronous responses create visible lag.*
+
+For freestanding (kernel/pre-OS) TPM emulation: **TCG reference code** can be compiled freestanding if you supply the mandatory platform layer. Serious engineering effort (weeks).
 
 **Why TPM is nearly impossible to spoof:**
 - EK private key never leaves the TPM. You can't extract it.
@@ -763,6 +828,62 @@ Ranked worst-to-best spoofer target:
 10. **Machine GUID / registry identity fields** — trivial registry writes.
 
 **Operational implication:** a spoofer handling only items 6-10 looks like a spoofer. A spoofer handling 3-10 is "commercial quality." Items 1-2 require either TPM clear (destroys BitLocker) or hypervisor (triggers anti-VM).
+
+---
+
+## Part 6.5 — KVM / VM-passthrough — a viable alternative path
+
+**Important community finding (UC thread 781548, Nov 2026):**
+
+EAC does **NOT** care about VM timing checks. Confirmed by adversemiller (legend tier, 60+ trust): *"there is zero reason to patch the host kernel for EAC."*
+
+This contradicts a common assumption that kernel-level timing patches are required. For EAC specifically, **passing environmental checks is sufficient** — timing side-channel analysis is not part of EAC's anti-VM surface.
+
+### What the community uses
+
+Two main public paths for running Fortnite in a VM:
+
+| Project | Author | What it is |
+|-|-|-|
+| **Nika-Read-Only** | ApexCV | Step-by-step QEMU/KVM Fortnite setup guide. Public. Not fully undetected. |
+| **AutoVirt** | Scrut1ny | Alternative VM-setup automation. Requires more VM-config knowledge. |
+
+Both on GitHub. Names rotate as repos get taken down.
+
+### Pre-requisites for the Nika path
+
+- Intel 12th gen+ or AMD Zen 4+ (per Nika guide): required for handling HVCI / EPT / NPT / LBR probing checks.
+- At least 16 GB RAM.
+- PC, not laptop.
+- Hyper-V must be enabled on the guest (mandatory per guide).
+
+### What has to pass checks
+
+- al-khaser (latest).
+- VM-Aware (latest + debug version).
+- All checks must show "good/undetected."
+
+### Common failure points
+
+Per janolaim (same thread):
+- Boot logo visible in VM-Aware debug → flag.
+- QEMU firmware visible → flag.
+- Standard NIC device description → emulate your own.
+
+### AMD vs Intel
+
+Per adversemiller:
+- **AMD lets you do whatever you want.** Simpler VM setup.
+- **Intel is a little more complex.** Different implementation needed.
+- Zen 3 (AMD, pre-Zen-4) may require extra work to handle EPT/LBR probing since Nika guide mandates Zen 4+.
+
+### The ongoing debate
+
+Per mattdevs (legend tier): *"I highly doubt any of these kids in here are actually ud on kvm. they beat vmaware and think they are good. big anticheat have private detection routines for this."*
+
+Per adversemiller (counter): *"there isn't really such a thing as 'private' detection methods anymore. If you make your VM look like baremetal, their methods will do nothing."*
+
+Operational takeaway: **VM-based Fortnite with Nika/AutoVirt + properly-spoofed firmware/boot/NIC is a viable current-build path**, but not a free lunch. Correlation ML still applies.
 
 ---
 

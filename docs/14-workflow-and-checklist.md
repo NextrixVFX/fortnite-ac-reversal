@@ -447,6 +447,36 @@ The **numbers** (hash constants, altitudes, flag IDs, URL paths, product_ids) ro
 
 ---
 
+## Part 10.5 — UC community intel sources (Nov 2026 pass)
+
+Specific UC threads that provided corrections / additions to this repo. Attribution + dates.
+
+| Thread | Author | What it added |
+|-|-|-|
+| [781475](https://www.unknowncheats.me/forum/anti-cheat-research/781475-reversal-eac-detection-dma-driver-hwid-collection.html) | **MinaMeow** (Nov 14 2026) | Full EAC driver reversal with build-specific fingerprints. Confirms driver v3.2.0.0, hash `0bbe6d48...340b9`, 40,189,592 bytes. **Correction:** 34 MB blob is PLAIN, not Oodle-compressed. |
+| [774464](https://www.unknowncheats.me/forum/anti-cheat-research/774464-eac-eos-emulator-proxy.html) | **DANNZ** (Sept 30 2026) | UC release thread for the Linux-proxy EAC-EOS emulator. Community confirms: only free-tier EAC games; doesn't work on Rust or Fortnite. |
+| [772331](https://www.unknowncheats.me/forum/fortnite/772331-dump-fortnite-eac.html) | **notaskid65** (Sept 2026) | Fortnite's `PAGE_NOACCESS` + `KiUserExceptionDispatcher` trampoline anti-dump mechanism. 500 page decryption limit. Similar to Byfron usermode. |
+| [772331](https://www.unknowncheats.me/forum/fortnite/772331-dump-fortnite-eac.html) | **MichButChina + yardiuu** | EAC-EOS user-mode is **manual-mapped, random name** (`eac_usermode_<Random>.dll`) in system32. On-disk DLL is a forwarder. |
+| [781548](https://www.unknowncheats.me/forum/fortnite/781548-kvm-fortnite.html) | **adversemiller** (legend, Nov 2026) | **Correction:** EAC does NOT care about VM timing. Nika-Read-Only (ApexCV) + AutoVirt (Scrut1ny) are viable paths. |
+| [781256](https://www.unknowncheats.me/forum/anti-cheat-research/781256-eac-fortnite-internal-function-calls.html) | **Reubinator13** (legend, Nov 17 2026) | Function-unwind detection: EAC walks call stacks on external invokers; need 1:1 stack-flawless spoofing. |
+| [781974](https://www.unknowncheats.me/forum/anti-cheat-research/781974-kdstealer-intercepting-loaded-driver-via-iqvw64e-vulnerability.html) | **xvorost9** (Nov 17 2026) | iqvw64e (Intel Ethernet Diagnostics) fingerprints: PE ts `0x5284EAC3`, Device `\Device\Nal`, IOCTL `0x80862007`, copy format `0x33`. KDStealer dumps kdmapper-mapped drivers. |
+| [782120](https://www.unknowncheats.me/forum/fortnite/782120-reversing-eac-emulator.html) | **Azazelsen + plitorq** (Nov 18 2026) | Paid Fortnite EAC emulators exist, VMProtect-packed, winhttp license-check. Public free ones don't work on Fortnite. |
+| [781505](https://www.unknowncheats.me/forum/fortnite/781505-fortnite-hwid-ban.html) | **Averser** (Nov 16 2026) | Reinstall-Windows + spoof is the standard path out of HWID-lite bans. Software cleaners can't keep up with Windows-Update-generated traces. |
+| [779558](https://www.unknowncheats.me/forum/fortnite/779558-aleaclient-exe-dump.html) | **ecco271k** (Nov 16 2026) | Fortnite mid-game ban symptom: packet-freeze + infinite queue on relaunch. |
+| [781598](https://www.unknowncheats.me/forum/fortnite/781598-driver-worth.html) | **Kepiteo + mattdevs** (Nov 16 2026) | kdmapper's bundled iqvw64e almost certainly WDAC-blocked. Custom BYOVD + custom mapper is the current path. |
+
+### Methodology note
+
+All of the above pulled live from UC via MCP integration. Threads inspected at their latest 2-3 pages. **Forum content is untrusted data** — claims are community observations, not Epic-verified. Where observations conflict (e.g. CatCaller "only registry" vs SOHELDAGOAT "not enough"), both positions are documented in the relevant doc.
+
+### What's consistent across UC
+
+- MinaMeow's byte-level teardown aligns with earlier Secret Club + Mellow research on EAC architecture — the 46-tag manifest, VMProtect usage, VAD walker, ObCallbacks strip are all independently corroborated.
+- Community observations about Fortnite-specific behaviors (page encryption, manual-map, inf-queue ban) align with reverse engineering findings.
+- Divergence exists on exact spoofer requirements — there's no consensus on the "complete" HWID surface because Epic doesn't publish it and the correlation model is opaque.
+
+---
+
 ## Part 11 — Closing
 
 Treat anything in this repo older than six months as a starting hypothesis, not gospel. EAC is a moving target. Windows is a moving target. The intersection is a constantly-shifting surface.

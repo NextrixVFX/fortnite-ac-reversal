@@ -63,6 +63,29 @@ Full catalog with capabilities + eras:
 - **Static scan of common WHQL vendor drivers** — any driver that exposes physical memory read/write via IOCTL is a candidate.
 - **loldrivers.io** — community catalog of known-vulnerable drivers.
 
+### iqvw64e specifics (the kdmapper-bundled Intel driver)
+
+The Intel Ethernet Diagnostics driver (`iqvw64e.sys`) is the specific BYOVD bundled with kdmapper itself. Confirmed fingerprints (via KDStealer thread 781974):
+
+| Field | Value |
+|-|-|
+| PE timestamp | `0x5284EAC3` |
+| Device object | `\Device\Nal` |
+| IOCTL | `0x80862007` |
+| Copy command format | `0x33` |
+
+Status in current blocklists: **almost certainly blocked** by current rules.bin driver sections (per community consensus — Kepiteo thread 781598). Using `kdmapper` with its stock bundled `iqvw64e.sys` against current-build Fortnite EAC will flag within session.
+
+### KDStealer — adjacent threat (xvorost9, Nov 2026)
+
+A third-party tool (not from EAC) that:
+- Loads via `kdmapper` to monitor other `kdmapper` operations.
+- Hooks Intel driver's device control.
+- Dumps any driver mapped through it to `C:\mapped_driver_N.bin`.
+- Idea from KDStinker (2019).
+
+**Why this matters for cheat developers:** if any software on the user's machine includes KDStealer (or similar), their kdmapper'd cheat driver can be captured to disk by a third party. Not an EAC detection — a parallel ecosystem threat.
+
 ### Hypervisor-based cheat detection
 
 A type-2 or stealth type-1 hypervisor that reads game memory from the host. Detected by:
@@ -110,6 +133,51 @@ Manual-mapping a cheat DLL into the game process via a kernel-mode writer, bypas
 | Map as RW initially, flip to RX momentarily to run | Transient executable detector catches the flip |
 | Use existing executable VADs (hollowing a legit module) | Integrity timer catches the `.text` hash change |
 | Run cheat code from pure data references with ROP | Expensive, slow, limited — mostly research territory |
+
+---
+
+## Part 2.5 — Function-unwind / call-stack detection + frame-counting
+
+Per **alexanderyy** (UC legend, trust 78 — thread 778933):
+
+> They are checking call chain from specific functions, if a frame leaves a specified module within x amount of frames they know it is hooked.
+
+And per **Reubinator13** (UC legend, thread 781256):
+
+> you need the stack to be 1:1 flawless (function unwind detection)
+
+**EAC does call-chain / frame-counting detection on external invokers AND on hooked internal calls.** Two specific mechanisms:
+
+### Mechanism 1: Frame-counting from instrumented functions
+
+EAC places call-stack-capturing probes at specific points inside the game. From those probes, it walks the stack upward. If a frame **leaves a specified module within X frames** of the probe, that's an anomaly — it means the natural call chain was redirected outside the expected module (e.g. your external invoker's code sits outside the game's modules).
+
+Example: EAC probes a specific UE function. It expects the call stack to go `GameCode → GameCode → GameCode → ...` within the game's modules. If frame-2 is outside any legit module, the call chain leaked → hooked.
+
+### Mechanism 2: Function-unwind detection
+
+EAC walks the call stack via `RtlCaptureStackBackTrace` or similar unwind APIs. Stack frames that don't correspond to function-unwind-data-valid return addresses → flag.
+
+### Requirements for a working call-stack spoofer against Fortnite EAC
+
+- **Must be 1:1 flawless** — the stack must look exactly like a legit UE internal invocation.
+- All frames must be within whitelisted game modules.
+- Unwind data must be consistent — return addresses must correspond to real function prologues.
+- RSP alignment must match what a natural call chain would produce.
+
+Simple "gadget-based" call spoofers don't work against current-build EAC.
+
+### Requirements for a working call-stack spoofer against Fortnite EAC
+
+- **Must be 1:1 flawless** — the stack must look exactly like a legit UE internal invocation.
+- Simple "gadget-based" call spoofers don't work against current-build EAC.
+- Need to replicate: return addresses, RBP frames, unwind data consistency, stack pointer alignment.
+
+### Detection mechanism
+
+EAC walks the call stack via `RtlCaptureStackBackTrace` or similar unwind APIs at specific instrumented points inside the game process. Stack frames that don't correspond to function-unwind-data-valid return addresses → flag.
+
+This is why the "external invoker to call internal UFUNCTIONs" approach has a limited lifespan — the stack walk catches it even if the data read/write succeeds.
 
 ---
 

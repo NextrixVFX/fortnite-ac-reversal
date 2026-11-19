@@ -2,7 +2,9 @@
 
 Deep reverse-engineering notes on Fortnite's full anti-cheat stack: Easy Anti-Cheat (classic + EOS variant), Fortnite's own integrity layer, HWID / fingerprint surface, trust-score mechanics, ETW-TI hazards, real-world emulator architectures, and an EAC emulation PoC.
 
-Current-build era: **late-2026** (EAC agent `EAC_2026_*`, Fortnite UE5).
+Current-build era: **late-2026** (EAC agent `EAC_2026_*`, EAC driver v3.2.0.0 Nov 2025 sign, Fortnite UE5).
+
+**Refreshed Nov 19 2026** with UC community intel — see [doc 14 Part 10.5](docs/14-workflow-and-checklist.md#part-105--uc-community-intel-sources-nov-2026-pass) for source thread attribution.
 
 > **Read before trusting any specific constant:** this is a map of the *architecture*. Offsets inside `EPROCESS`, altitude strings, XOR keys, AES salts, numeric IOCTL codes, pin hashes, and flag IDs rotate every few builds. Always re-derive constants against your own pulled binaries.
 

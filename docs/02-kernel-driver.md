@@ -8,6 +8,17 @@ This doc is **the complete kernel-side reversal.** Byte-level offsets, every cal
 
 ## Part 1 — The binary itself
 
+### Build fingerprint (verified against UC community teardown — MinaMeow, Nov 2026)
+
+```
+Driver version : 3.2.0.0
+File size      : 40,189,592 bytes
+SHA256         : 0bbe6d48f45fc155f1c1d029df8de67f221b7329010164eda2dd06d7978340b9
+Signer         : Epic Games Inc. via DigiCert Trusted G4 chain
+Sign timestamp : Nov 2025
+Source thread  : https://www.unknowncheats.me/forum/anti-cheat-research/781475-reversal-eac-detection-dma-driver-hwid-collection.html
+```
+
 ### Layout (current-build teardown)
 
 Target build fingerprint: 40 MB driver, 9 sections, entry at end of `.text` (`0x26F738`). If your `.sys` is smaller / entry at start, you have a different build — the *patterns* here apply, the numbers may have shifted.
@@ -210,11 +221,11 @@ Other flattened routines with the same pattern:
 
 Rule of thumb: **anything ≥ ~`0x600` bytes is flattened.**
 
-### 2.f — The 33 MB blob
+### 2.f — The 34 MB blob (CORRECTION — it's PLAIN, not encrypted/compressed)
 
-`0x46A616` up to `~0x2693000`. Not encrypted — **Oodle-compressed.**
+`0x46A616` up to `~0x2692400` raw. **Plain unencrypted VM stream / handler store.**
 
-`.rdata` contains a full plaintext list of Oodle codec and level names at `0x30C9B0 – 0x30CB48`:
+**Correction note:** Earlier revisions of this doc (and some third-party writeups) described this blob as Oodle-compressed. MinaMeow's current-build teardown (Nov 2026) tested this and confirmed the blob is **plain** — the Oodle codec names present in `.rdata` at `0x30C9B0 – 0x30CB48`:
 
 ```
 Kraken Selkie Mermaid Leviathan Hydra LZHLW LZBLW LZNIB LZNA LZB16
@@ -223,7 +234,13 @@ Optimal1..Optimal5 HyperFast1..HyperFast4
 "newlz chunk type %d = %s [%d->%d]"
 ```
 
-A full Oodle/Oozle decompressor is embedded (a good chunk of the 5544 functions is that), and the module store is Oodle-compressed. **"Decryption" = decompression at runtime + whatever layered on top.** Key handling is unverified (probably fetched from Epic servers during init).
+...are **compiled-in but unused** against this particular blob. The Oodle decompressor is present (part of the 5544 functions), but the "monster section" payload after `0x46A616` is **plain handler/VM stream bytecode** that gets interpreted directly by the custom VM. No decompression step is performed on the blob itself; VMProtect-style handlers walk it in place.
+
+This is actually *worse* for a reverser than if it were compressed — the blob's size (~34 MB) is entirely in-band obfuscation that slows your tooling without meaningful protection. MinaMeow's words: "a giant plain 34 MB handler blob that slows your tooling down way more than it actually protects anything."
+
+### Why this correction matters
+
+Previous common assumption: "crack the Oodle key and the blob reveals cheat-rules-like data." Actual reality: the blob **is** the VM program — walking it with an Oodle decoder gives you garbage. The way to understand the blob is to reverse the VM interpreter + handler dispatch, then disassemble the bytecode in place.
 
 ---
 

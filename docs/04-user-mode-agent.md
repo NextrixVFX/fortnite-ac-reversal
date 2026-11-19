@@ -11,9 +11,28 @@ This doc covers: getting the agent readable, DllMain init chain, every worker th
 
 ## Part 1 — Getting the agent into a readable state
 
-The on-disk DLL is VMProtect-packed with import protection. Workflow:
+### Where the agent actually lives
 
-1. **Dump from memory** after full init inside the game.
+**Important:** On current-build EAC-EOS, the on-disk `EasyAntiCheat_EOS_x64.dll` is **not the true user-mode agent**. Per MichButChina and yardiuu (UC thread 772331):
+
+- EAC drops its real user-mode module as a randomly-named DLL into `system32`.
+- Name pattern: `eac_usermode_<Random>.dll`.
+- This dropped DLL **is manual-mapped** by the EAC service, not loaded via `LoadLibrary`.
+- No LDR entry in the game process for the real agent.
+- The on-disk `EasyAntiCheat_EOS_x64.dll` is a thin forwarder / loader that bootstraps the real module.
+
+**Implication for reversing:** dumping the real agent requires either:
+- Dumping the manual-mapped memory region from the game process after EAC init.
+- Capturing the `system32`-dropped random-name DLL before it gets wiped.
+- Snooping on EAC's service as it manual-maps into the game.
+
+The traditional "grab `EasyAntiCheat_EOS_x64.dll` off disk" workflow gives you the loader stub, not the full scanner implementation.
+
+### Workflow (updated for manual-mapped layout)
+
+The on-disk DLL is VMProtect-packed with import protection. The in-memory manual-mapped module is also VMProtect-packed but has its IAT resolved. Workflow:
+
+1. **Dump from memory** after full init inside the game. Target the manual-mapped region, not the LDR-loaded forwarder.
 2. **Scylla** the dump to rebuild the IAT from resolved pointers.
 3. **NoVmp** the VMP regions.
 4. **Hand-lift residual handlers** with unicorn-engine + VTIL.

@@ -80,6 +80,25 @@ Service is `SERVICE_DEMAND_START` — nothing loads it until a protected game ne
 
 ---
 
+## Runtime-dropped — the real user-mode scanner (current build)
+
+**Not in the bundled files above.** On current-build EAC-EOS, the real user-mode scanner module is **dropped at runtime** to `system32` with a randomized name:
+
+```
+C:\Windows\System32\eac_usermode_<Random>.dll
+```
+
+Attributes:
+- Dropped by the EAC service during init.
+- **Manual-mapped** into the game process (not `LoadLibrary`'d).
+- No LDR entry in the game process.
+- Name rotates per install / per session.
+- The on-disk `EasyAntiCheat_EOS_x64.dll` in the Fortnite bundle is a **forwarder/loader stub**, not the real scanner.
+
+**Implication for research:** capturing the real agent requires either process-memory dump (per [04 user-mode agent](04-user-mode-agent.md)) or racing to copy the `system32` drop before EAC wipes it. The bundled DLL is a thin wrapper; the useful reversing target is the dropped random-name DLL. Source: UC thread 772331 (MichButChina + yardiuu, Sept 2026).
+
+---
+
 ## Historical — BattlEye (old Fortnite builds only)
 
 Path: `FortniteGame\Binaries\Win64\BattlEye\`

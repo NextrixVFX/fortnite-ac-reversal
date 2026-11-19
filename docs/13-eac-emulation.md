@@ -400,6 +400,43 @@ A cheat developer can beat one layer but not all three simultaneously for long. 
 
 ---
 
+## Part 12.5 — Paid Fortnite EAC emulators (do exist, with caveats)
+
+Per plitorq and Azazelsen (UC thread 782120, Nov 2026):
+
+**Paid EAC emulators that specifically target Fortnite are sold on private channels.** Not public. Consistent community observations:
+
+- **VMProtect-packed** — the emulator binary itself is VMP'd to resist reversal.
+- **winhttp license-check** — the emulator makes a winhttp request to a key server at launch to validate the license.
+- **Recurring subscription model** — weekly/monthly keys.
+
+### Reversing a paid emulator (per Azazelsen)
+
+> managed to get a paid eac emulator exe tried to reverse it but that bih had vmprotect i have low knowledge abt reversing vmprotected software so im learning it still once i figure it out its just a matter of finding the imported winhttp req and hooking to ur own key sys
+
+Pattern: find the WinHttp API call in the emulator binary, hook it to redirect to an attacker-controlled key server, serve fake "license OK" responses → run the emulator without paying.
+
+### Community consensus on free public emulators for Fortnite
+
+Confirmed across multiple threads (781422, 781288, 782120):
+- **"It will never work with EAC on fortnite, maybe on low tier game not fortnite."** (janolaim, direct quote)
+- **"only works on free-tier eac games"** (NextrixVFX)
+- The DANNZ/huzun1 EAC-EOS Proxy emulator → VRChat and similar, **not Fortnite**.
+
+**Practical takeaway:** no public free Fortnite EAC emulator exists as of Nov 2026. Paid emulators exist but are proprietary + VMP-protected + cycle-key-locked.
+
+### The emulator-vs-reinstall economics for HWID-banned players
+
+Common thread in current discussions: HWID-banned players debating emulator vs full-reinstall.
+
+Averser (UC thread 781505): *"Cleanall diskpart. Reinstall win. Reinstalling Windows is enough to clean everything. because each update leaves a lot of new traces. cleaning software can barely keep up."*
+
+Reinstall-Windows is the **cheapest reliable path** out of HWID-lite bans (24h-365day duration) — not a full hardware-level HWID ban.
+
+**Lesson**: software-only cleaners struggle against EAC's trace surface because Windows auto-regenerates traces across updates. Nuking the OS is operationally simpler than tracking every artifact.
+
+---
+
 ## Part 13 — Historical analogies
 
 Nothing novel in the architecture. The specific implementation against current Fortnite is just more work than against older games because current-build EAC verifies signatures the stub can't produce.
