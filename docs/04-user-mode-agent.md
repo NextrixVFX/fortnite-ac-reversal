@@ -5,7 +5,7 @@ Where most of EAC's intelligence lives. If your reversing time budget isn't weig
 - The driver is maybe 8-10 KLOC of kernel C.
 - The agent, unpacked, is probably 60-90 KLOC of user-mode C++, 30-40% of it inside VMProtect handlers you have to devirtualize before any of it reads meaningfully.
 
-This doc covers: getting the agent readable, DllMain init chain, every worker thread, every scanner, telemetry endpoints with exact URLs + event catalog, the trust-score model + per-handler feature flags, pin check mechanics, severity + flag-ID taxonomy. **Everything the agent does from load to unload.**
+This doc covers: getting the agent readable, the **export-driven init model** (not a classic DllMain chain — that's a corrected misconception, see Part 2), every worker thread, every scanner, telemetry endpoints with exact URLs + event catalog, the trust-score model + per-handler feature flags, pin check mechanics, severity + flag-ID taxonomy. **Everything the agent does from load to unload.**
 
 ---
 
@@ -44,36 +44,164 @@ Full protection-stack details in [08 — protection stack](08-protection-stack.m
 
 ---
 
-## Part 2 — DllMain + init chain
+## Part 2 — The REAL entry model (not a classic DllMain chain)
+
+### CORRECTION (Nov 2026)
+
+Earlier revisions of this doc showed a classic `DllMain → init chain → spawn workers` pattern. **That's wrong architecturally.** EAC's user-mode agent does NOT initialize from `DllMain`. Verified via UC thread 772331 (MichButChina, yardiuu — manual-map disclosure) + thread 781379 (Hec4te, Reubinator13 — EAC's specific detection of classic DllMain-triggered injection) + the UC emulator source code (uc_emulator analysis in [analysis/02](analysis/02-uc-linux-proxy-emulator.md), which deliberately mimics EAC's real export-driven pattern).
+
+### The actual layered structure
+
+Two distinct user-mode components:
+
+```
+C:\Program Files\Epic Games\Fortnite\...\EasyAntiCheat\
+    EasyAntiCheat_EOS_x64.dll         <- bundled on disk
+                                         Thin FORWARDER STUB
+                                         DllMain is minimal
+                                         Does NOT contain the scanner logic
+                                         Called by EOS SDK / game IAT
+
+C:\Windows\System32\
+    eac_usermode_<Random>.dll         <- dropped at runtime by EAC service
+                                         Random name per install / session
+                                         MANUAL-MAPPED into the game process
+                                         No LDR entry
+                                         DllMain is NOT auto-invoked by Windows
+                                         This is the real scanner
+```
+
+### Why there's no classic DllMain-based init chain
+
+**Windows does not automatically call `DllMain` on manual-mapped modules.** `LoadLibrary` calls `DllMain`. Manual mapping (`VirtualAllocEx` + `WriteProcessMemory` + relocate + fix IAT) skips it unless the mapper explicitly jumps to it.
+
+And EAC specifically avoids having the mapper jump to `DllMain` of the scanner, because:
+
+1. **A new thread calling DllMain is visible.** EAC's own `PsSetCreateThreadNotifyRoutine` catches thread creation into a protected process — if EAC used `CreateRemoteThread` to call its own scanner's DllMain, it would flag against its own rules.
+2. **EAC specifically detects classic DllMain-triggered injection patterns in CHEAT loaders** (see "Cheat-side mirror" below). Using the same pattern for its own agent would be inconsistent.
+3. **Export-driven initialization is cleaner** — the EOS SDK calls specific EAC exports at known lifecycle points (session begin, poll status, end session). Init tied to those lifecycle calls matches what the game actually needs.
+
+### Where initialization actually happens
+
+Init is **deferred and export-driven**. The EOS SDK (`EOSSDK-Win64-Shipping.dll`) calls into EAC's exports on lifecycle events:
+
+| EOS SDK call | What EAC does |
+|-|-|
+| `EOS_Initialize` | Pre-session: no pipe, no driver call. Just set up internal state tables inside the agent. |
+| `EOS_Platform_Create` | Still pre-session. Reserve platform handle. |
+| `EOS_Platform_GetAntiCheatClientInterface` | Returns the AntiCheat client handle. Still pre-session. |
+| **`EOS_AntiCheatClient_BeginSession`** | **This is where real work happens**: parse session token, connect pipe to launcher, driver session auth via IOCTL, spawn worker threads, environment sweep, install game hooks. |
+| `EOS_AntiCheatClient_PollStatus` | Periodic game-driven poll — reports pending state transitions. |
+| `EOS_AntiCheatClient_ReceiveMessageFromServer` | Server → client AC packet; agent dispatches to scanner logic. |
+| `EOS_AntiCheatClient_AddNotifyMessageToServer` | Game registers a callback for outbound AC messages. |
+| `EOS_AntiCheatClient_AddNotifyClientIntegrityViolated` | Game registers a callback for integrity-violation notifications. |
+| `EOS_AntiCheatClient_EndSession` | Tears down pipe, stops workers, drops driver auth. |
+
+**Pseudocode of the actual `BeginSession` handler** (what the earlier incorrect DllMain section was trying to describe):
 
 ```c
-BOOL DllMain(HINSTANCE h, DWORD why, LPVOID rsv)
+EOS_EResult
+EAC_AntiCheatClient_BeginSession(EOS_HAntiCheatClient h,
+                                 const EOS_AntiCheatClient_BeginSessionOptions* opts)
 {
-    if (why == DLL_PROCESS_ATTACH) return eac_agent_init();
-    if (why == DLL_PROCESS_DETACH) eac_agent_fini();
-    return TRUE;
-}
+    if (!parse_session_token_from_opts(opts))
+        return EOS_InvalidParameters;
 
-BOOL eac_agent_init(void)
-{
-    parse_cmdline_token_or_bail();
-    verify_own_dll_integrity_or_bail();      // first self-check tick
-    pipe_connect();
+    verify_own_integrity_first_tick();        // self-check
+    pipe_connect();                            // to EasyAntiCheat_EOS.exe
     pipe_hello();
-    driver_session_auth();
-    rules_load_and_decrypt();
-    environment_sweep_once();                 // anti-vm, anti-debug,
-                                              // initial module probe,
-                                              // SMBIOS fingerprint cache
-    spawn_worker_threads();
-    install_game_hooks();
+    driver_session_auth();                     // IOCTL_EAC_SESSION_AUTH
+    // Note: rules.bin is typically loaded/decrypted by the SERVICE, not here.
+    //       The service pushes parsed rules to the scanner via the pipe.
+    environment_sweep_once();                  // anti-vm, anti-debug,
+                                               // initial module probe,
+                                               // SMBIOS fingerprint cache
+    spawn_worker_threads();                    // scan/pipe/telemetry/integrity/input/capture/env
+    install_game_hooks();                      // EOS SDK ordinal-call integration
+
+    return EOS_Success;
+}
+```
+
+### What the bundled on-disk DLL's DllMain actually does
+
+Minimal. Typical pattern for an EOS-API-compatible stub:
+
+```c
+BOOL WINAPI DllMain(HINSTANCE h, DWORD why, LPVOID rsv)
+{
+    if (why == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(h);          // reduce DLL_THREAD_* noise
+        // That's essentially it. Maybe some TLS slot init.
+        // No pipe, no driver auth, no workers.
+    }
     return TRUE;
 }
 ```
 
+This matches the pattern observed in the publicly-analyzed UC emulator source ([analysis/02](analysis/02-uc-linux-proxy-emulator.md)) which is explicitly designed as a drop-in replacement for the bundled `EasyAntiCheat_EOS_x64.dll` — its own `DllMain` is minimal, and it implements the EOS exports that do the real work.
+
+### Cheat-side mirror — why classic DllMain-based injection fails on current EAC
+
+This is directly confirmed as a current-build detection. Per multiple UC legends:
+
+**Hec4te** (legend, trust 87 — thread 781379):
+> You need to find unusual structures to replace and execute with, all the methods that are known publicly EAC has a way to counter them or flag them, this includes some methods from mitre.org too.
+
+**Reubinator13** (legend — thread 781379):
+> pointer swap some function to call ur entrypoint, or ideally, dont even have an entrypoint, just pointerswap to your main thread and run from a hook. btw everything you doing is detected.
+
+**InsideExploit** (legend, trust 84 — thread 736216):
+> face injector 1:1 rewritten but with data ptr swap to call dllmain lmao
+> someone could take face injector and it would work on eac. all you gotta change is the way you call DllMain, nothing else.
+
+**bigslim04** (legend — thread 781379):
+> Thread hijacking, dont module stomp they can easily check.
+
+### The specific detection path for classic DllMain injection
+
+1. Classic injector: `CreateRemoteThread(LoadLibraryA, path)` or `QueueUserAPC(LoadLibraryA, thread, path)`.
+2. `LoadLibraryA` eventually calls `DllMain(DLL_PROCESS_ATTACH)` from a new / hijacked thread.
+3. EAC observes the new thread via `PsSetCreateThreadNotifyRoutine` → thread start address is outside any whitelisted module → **flag hard** (per [02 kernel driver](02-kernel-driver.md)).
+4. EAC's `ETW-TI` subscription also fires on the APC injection event if APC-based.
+5. Game process gets closed by EAC's response (not a kernel kill; EAC's agent initiates graceful termination via the pipe → launcher kills).
+
+### What works instead (current-build)
+
+Per the legends in thread 781379:
+- **Pointer-swap a legitimate function pointer** (vtable entry, callback pointer, virtual function dispatch) to redirect to your code.
+- **Hook into an existing legit thread** via pointer swap — avoid creating any new thread.
+- **No DllMain-style entrypoint** — your cheat runs from inside the hooked function's natural execution path.
+
+### The specific current-public injection pattern (per stld, thread 736216)
+
+Full technical breakdown of a working current-build injector:
+
+| Component | Detail |
+|-|-|
+| BYOVD base | `inpoutx64.sys` hash `f8965fdce668692c3785afa3559159f9a18287bc0d53abb21902895a8ecf221b` — straight-up `memmove` user-input IOCTL |
+| Mapper | Custom reflective loader shellcode |
+| Comms channel | `KeQueryAuxiliaryCounterFrequency` abused as pointer-swap comm |
+| Process open | `ZwOpenProcess` without `OBJ_KERNEL_HANDLE` flag |
+| Memory alloc | `ZwAllocateVirtualMemory(MEM_COMMIT \| MEM_RESERVE, PAGE_EXECUTE_READWRITE)` |
+| Staging trampoline | **`graphics-hook64.dll + 0x42DC8`** (OBS's graphics hook module — used as a legit-signed landing pad) |
+| DllMain invocation | Data-pointer swap to redirect a legit function pointer to call DllMain (not the Windows automatic call) |
+
+**OBS staging note:** `graphics-hook64.dll` is OBS Studio's graphics capture module, legitimately loaded into any process OBS is capturing. Current-public injectors require the user to have OBS running with capture active, then use a known offset inside the OBS hook DLL as their trampoline landing. stld (thread 736216) flags this as "over-engineered yet primitive" — it works but EAC's blacklist updates catch it fast.
+
+### Implication for reversers
+
+If you're trying to reverse the real EAC scanner:
+1. **Don't look at `EasyAntiCheat_EOS_x64.dll`'s DllMain** for the scanner logic — it's not there.
+2. **Dump the manual-mapped region** inside a live Fortnite game process.
+3. **Trace the EOS exports** the game calls — that's where the real init happens.
+4. **`EOS_AntiCheatClient_BeginSession`** is the critical function to analyze — it's the gateway to the scanner's real work.
+
 ---
 
-## Part 3 — Worker threads
+## Part 3 — Worker threads (spawned at BeginSession, NOT at DllMain)
+
+Workers spawn inside `EOS_AntiCheatClient_BeginSession` (see Part 2). They are not present before the game explicitly asks for an AC session.
 
 | Thread | Cadence | Job |
 |-|-|-|
@@ -84,6 +212,8 @@ BOOL eac_agent_init(void)
 | `input_worker` | continuous | Mouse/keyboard hooks, distributional stats. |
 | `capture_worker` | server-gated | DXGI OutputDuplication + Win32 `Graphics.Capture`. |
 | `env_worker` | ~30s | Environmental drift check (SMBIOS, MAC, disk serial, machine GUID). |
+
+**Workers are torn down on `EOS_AntiCheatClient_EndSession`** — not left running across session boundaries. Each new session gets a fresh worker set.
 
 ---
 

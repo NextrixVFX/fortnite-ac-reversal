@@ -460,10 +460,30 @@ Specific UC threads that provided corrections / additions to this repo. Attribut
 | [781548](https://www.unknowncheats.me/forum/fortnite/781548-kvm-fortnite.html) | **adversemiller** (legend, Nov 2026) | **Correction:** EAC does NOT care about VM timing. Nika-Read-Only (ApexCV) + AutoVirt (Scrut1ny) are viable paths. |
 | [781256](https://www.unknowncheats.me/forum/anti-cheat-research/781256-eac-fortnite-internal-function-calls.html) | **Reubinator13** (legend, Nov 17 2026) | Function-unwind detection: EAC walks call stacks on external invokers; need 1:1 stack-flawless spoofing. |
 | [781974](https://www.unknowncheats.me/forum/anti-cheat-research/781974-kdstealer-intercepting-loaded-driver-via-iqvw64e-vulnerability.html) | **xvorost9** (Nov 17 2026) | iqvw64e (Intel Ethernet Diagnostics) fingerprints: PE ts `0x5284EAC3`, Device `\Device\Nal`, IOCTL `0x80862007`, copy format `0x33`. KDStealer dumps kdmapper-mapped drivers. |
+| [736216](https://www.unknowncheats.me/forum/anti-cheat-research/736216-eac-injector.html) | **stld + InsideExploit + Paysonism** (Feb 2026, legends) | Current-build public EAC injection pattern: BYOVD (`inpoutx64.sys` hash `f8965fdce...f221b`), reflective loader, `graphics-hook64.dll+0x42DC8` OBS trampoline, `KeQueryAuxiliaryCounterFrequency` as comm channel, **data-ptr-swap to call DllMain** (not Windows auto). |
+| [781379](https://www.unknowncheats.me/forum/anti-cheat-research/781379-help-kernel-injector-eac-blocking-dllmain-trigger.html) | **Hec4te + Reubinator13 + bigslim04** (Nov 2026, legends) | EAC actively detects classic DllMain-triggered injection (APC + LoadLibrary + CreateRemoteThread). Working pattern: pointer-swap legitimate function pointer, hook into existing thread, no classic entrypoint. Module stomping is detected via file-vs-memory compare. |
 | [782120](https://www.unknowncheats.me/forum/fortnite/782120-reversing-eac-emulator.html) | **Azazelsen + plitorq** (Nov 18 2026) | Paid Fortnite EAC emulators exist, VMProtect-packed, winhttp license-check. Public free ones don't work on Fortnite. |
 | [781505](https://www.unknowncheats.me/forum/fortnite/781505-fortnite-hwid-ban.html) | **Averser** (Nov 16 2026) | Reinstall-Windows + spoof is the standard path out of HWID-lite bans. Software cleaners can't keep up with Windows-Update-generated traces. |
 | [779558](https://www.unknowncheats.me/forum/fortnite/779558-aleaclient-exe-dump.html) | **ecco271k** (Nov 16 2026) | Fortnite mid-game ban symptom: packet-freeze + infinite queue on relaunch. |
 | [781598](https://www.unknowncheats.me/forum/fortnite/781598-driver-worth.html) | **Kepiteo + mattdevs** (Nov 16 2026) | kdmapper's bundled iqvw64e almost certainly WDAC-blocked. Custom BYOVD + custom mapper is the current path. |
+
+### Correction landed — DllMain init chain (Nov 19 2026)
+
+**What was wrong:** Earlier revisions of [doc 04 Part 2](04-user-mode-agent.md#part-2--the-real-entry-model-not-a-classic-dllmain-chain) showed EAC's user-mode agent initializing from a classic `DllMain(DLL_PROCESS_ATTACH)` chain — pipe connect, driver auth, worker spawn, rules load, all inside DllMain.
+
+**Why it was wrong:**
+1. The real scanner is manual-mapped into the game process (not LoadLibrary'd) per MichButChina + yardiuu (thread 772331). Windows does **not** auto-invoke `DllMain` on manual-mapped modules.
+2. EAC specifically **detects** classic DllMain-triggered injection as a cheat pattern — if EAC used the same pattern for its own agent, it would flag itself. Confirmed by Hec4te, Reubinator13, InsideExploit, bigslim04 (threads 736216, 781379).
+3. The bundled on-disk `EasyAntiCheat_EOS_x64.dll` is a forwarder stub — its DllMain is minimal (likely just `DisableThreadLibraryCalls`). The actual scanner work is in exported functions.
+
+**What's correct:**
+- Initialization is **deferred and export-driven**. The EOS SDK calls into EAC's exports at lifecycle events.
+- **`EOS_AntiCheatClient_BeginSession`** is the real entry point for session-specific work (pipe connect, driver auth, worker spawn, env sweep, hook install).
+- Workers are torn down on `EOS_AntiCheatClient_EndSession`, not persistent across sessions.
+
+**Cheat-side implication (also corrected in [doc 12 Part 2.5](12-cheat-detection.md#part-25--function-unwind--call-stack-detection--frame-counting)):** classic DllMain injection for cheats is **actively detected** by EAC's thread-callback + ETW-TI. Current public injection pattern (stld, thread 736216): BYOVD + manual map + `graphics-hook64.dll+0x42DC8` (OBS) trampoline + pointer-swap to call DllMain (not Windows automatic).
+
+Credit: Sam's reviewer who flagged the original error, verified via UC threads 772331, 736216, 781379 (Nov 2026).
 
 ### Methodology note
 
